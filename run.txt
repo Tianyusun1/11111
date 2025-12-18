@@ -29,7 +29,7 @@ bash stage2_generation/run_train.sh
 python integrated_inference.py \
   --layout_ckpt "/home/610-sty/layout2paint/outputs/train1/rl_best_reward.pth" \
   --taiyi_model_path "/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1" \
-  --lora_path "/home/610-sty/layout2paint/outputs/taiyi_ink_controlnet_v2/checkpoint-24000/unet_lora" \
-  --controlnet_s_path "/home/610-sty/layout2paint/outputs/taiyi_ink_controlnet_v2/checkpoint-24000/structure" \
-  --controlnet_t_path "/home/610-sty/layout2paint/outputs/taiyi_ink_controlnet_v2/checkpoint-24000/style" \
+  --lora_path "/home/610-sty/layout2paint/outputs/taiyi_ink_controlnet_v2/unet_lora" \
+  --controlnet_seg_path "/home/610-sty/layout2paint/outputs/taiyi_ink_controlnet_v2/controlnet_structure" \
+  --controlnet_t_path "/home/610-sty/layout2paint/outputs/taiyi_ink_controlnet_v2/controlnet_style" \
   --output_base "./full_results_50"

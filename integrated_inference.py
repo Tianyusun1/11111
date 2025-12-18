@@ -36,12 +36,12 @@ POEMS_50 = [
 ]
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Poem2Ink: 50句诗歌全自动批量推理（含热力图）")
-    parser.add_argument("--output_base", type=str, default="./inference_results_v50", help="结果保存的根目录")
+    parser = argparse.ArgumentParser(description="Poem2Ink: 50句诗歌全自动批量推理（彩色语义强绑定版）")
+    parser.add_argument("--output_base", type=str, default="./inference_results_v50_color", help="结果保存的根目录")
     parser.add_argument("--layout_ckpt", type=str, required=True, help="强化学习后的布局模型路径")
     parser.add_argument("--taiyi_model_path", type=str, required=True, help="本地太乙模型路径")
     parser.add_argument("--lora_path", type=str, required=True, help="微调后的 LoRA 权重目录")
-    parser.add_argument("--controlnet_s_path", type=str, required=True, help="ControlNet 结构流路径")
+    parser.add_argument("--controlnet_seg_path", type=str, required=True, help="语义分割控制网路径 (对应彩色Mask)")
     parser.add_argument("--controlnet_t_path", type=str, required=True, help="ControlNet 风格流路径")
     return parser.parse_args()
 
@@ -69,23 +69,26 @@ def main():
     layout_model.to(device).eval()
     tokenizer_bert = BertTokenizer.from_pretrained(config['model']['bert_path'])
 
-    print("[Init] 正在加载太乙生成模型与 ControlNets (Stage 2)...")
-    controlnet_s = ControlNetModel.from_pretrained(args.controlnet_s_path, torch_dtype=torch.float16)
+    print("[Init] 正在加载太乙生成模型与语义控制网 (Stage 2)...")
+    # 核心修改：这里加载的是支持彩色语义分割输入的 ControlNet
+    controlnet_seg = ControlNetModel.from_pretrained(args.controlnet_seg_path, torch_dtype=torch.float16)
     controlnet_t = ControlNetModel.from_pretrained(args.controlnet_t_path, torch_dtype=torch.float16)
     
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
         args.taiyi_model_path,
-        controlnet=[controlnet_s, controlnet_t],
+        controlnet=[controlnet_seg, controlnet_t],
         torch_dtype=torch.float16,
         local_files_only=True 
     ).to(device)
     
     pipe.load_lora_weights(args.lora_path)
     pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
+    
+    # 初始化彩色 Mask 生成器
     ink_gen = InkWashMaskGenerator(width=512, height=512)
 
     # --- 2. 批量推理循环 ---
-    print(f"\n🚀 开始全量推理 50 句诗歌...")
+    print(f"\n🚀 开始彩色语义强绑定推理 50 句诗歌...")
     
     for i, poem in enumerate(tqdm(POEMS_50, desc="Overall Progress")):
         poem_clean = poem[:12].replace("，", "_").replace("。", "").replace("？", "").replace("！", "").strip()
@@ -93,36 +96,43 @@ def main():
         os.makedirs(save_dir, exist_ok=True)
 
         try:
-            # STEP 1: 布局生成与热力图提取
-            # 修改 greedy_decode_poem_layout 调用，确保热力图文件被保存到相应目录
-            # 注意：您的 greedy_decode 内部已经实现了 heatmap 的保存逻辑
+            # STEP 1: 布局生成
             layout = greedy_decode_poem_layout(
                 layout_model, tokenizer_bert, poem, 
                 max_elements=30, device=device, mode="sample"
             )
             
-            # 移动/复制生成的集成热力图到当前文件夹
-            # 假设 greedy_decode 生成的默认路径是 outputs/heatmaps/integrated_...
+            # 保存热力图
             heatmap_temp_path = f"outputs/heatmaps/integrated_{poem_clean}流.png"
             if os.path.exists(heatmap_temp_path):
                 os.rename(heatmap_temp_path, os.path.join(save_dir, "01_heatmap.png"))
 
+            # 保存布局草图 (确保这里的颜色与 ink_mask 一致)
             draw_layout(layout, f"RL Inference: {poem}", os.path.join(save_dir, "01_layout.png"))
 
-            # STEP 2: 水墨 Mask 转换
+            # STEP 2: 彩色语义 Mask 转换 [核心创新点修改]
+            # 现在生成的 mask_img 是彩色的 RGB 图像
             mask_img = ink_gen.convert_boxes_to_mask(layout)
-            mask_img.save(os.path.join(save_dir, "02_ink_mask.png"))
+            mask_img.save(os.path.join(save_dir, "02_semantic_color_mask.png"))
 
-            # STEP 3: 最终山水画生成
-            style_suffix = "，水墨画，中国画，写意，杰作，高分辨率"
-            full_prompt = f"{poem}{style_suffix}"
+            # STEP 3: 语义强绑定 Prompt 构建 [骚操作]
+            # 为了强化颜色与意象的绑定，我们在提示词中加入颜色引导描述
+            semantic_binding_hints = (
+                "，红色区域画山，蓝色区域画水，绿色区域画树，黄色区域画建筑，"
+                "紫色区域画花卉，青色区域画人物，橙色区域画飞鸟"
+            )
+            style_suffix = "，写意水墨画，中国画风格，杰作，高分辨率，层次分明"
             
+            full_prompt = f"{poem}{semantic_binding_hints}{style_suffix}"
+            
+            # 最终山水画生成
+            # 传入彩色 Mask 作为控制信号
             final_image = pipe(
                 prompt=full_prompt,
-                image=[mask_img, mask_img],
-                num_inference_steps=30,
-                guidance_scale=7.5,
-                controlnet_conditioning_scale=[1.0, 0.8]
+                image=[mask_img, mask_img], # 两路 ControlNet 均以此彩色语义为基准
+                num_inference_steps=35,
+                guidance_scale=8.5,
+                controlnet_conditioning_scale=[1.2, 0.7] # 调高语义流权重以增强“强绑定”
             ).images[0]
             
             final_image.save(os.path.join(save_dir, "03_final_painting.png"))

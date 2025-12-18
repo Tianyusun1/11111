@@ -1,19 +1,21 @@
 import os
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
 
-# 类别定义 (必须与 dataset.py 中的 ID 2-10 保持一致)
+# =============================================================
+# [核心同步] 类别颜色定义 (必须与 ink_mask.py 保持完全一致)
+# =============================================================
 CLASS_COLORS = {
-    2: "red",      # mountain
-    3: "blue",     # water
-    4: "green",    # people
-    5: "brown",    # tree
-    6: "yellow",   # building
-    7: "cyan",     # bridge
-    8: "magenta",  # flower
-    9: "orange",   # bird
-    10: "lime"     # animal
+    2: "red",      # mountain (山): 对应 ink_mask 的 (255, 0, 0)
+    3: "blue",     # water (水): 对应 ink_mask 的 (0, 0, 255)
+    4: "cyan",     # people (人): 对应 ink_mask 的 (0, 255, 255)
+    5: "green",    # tree (树): 对应 ink_mask 的 (0, 255, 0)
+    6: "yellow",   # building (建筑): 对应 ink_mask 的 (255, 255, 0)
+    7: "magenta",  # bridge (桥): 对应 ink_mask 的 (255, 0, 255)
+    8: "purple",   # flower (花): 对应 ink_mask 的 (128, 0, 128)
+    9: "orange",   # bird (鸟): 对应 ink_mask 的 (255, 165, 0)
+    10: "brown"    # animal (动物): 对应 ink_mask 的 (165, 42, 42)
 }
 
 CLASS_NAMES = {
@@ -22,14 +24,18 @@ CLASS_NAMES = {
 }
 
 def draw_layout(layout_seq: List[Tuple], poem: str, output_path: str, img_size: Tuple[int, int] = (512, 512)):
-    """(保持原有布局绘制函数不变)"""
+    """
+    绘制带有颜色标注的布局草图，用于验证语义绑定是否正确。
+    """
     try:
-        img = Image.new('RGB', img_size, 'white')
+        # 创建黑色背景，让彩色标注框更显眼 (更“骚”)
+        img = Image.new('RGB', img_size, (20, 20, 20)) 
         draw = ImageDraw.Draw(img)
         W, H = img_size
         
         try:
-            font = ImageFont.truetype("arial.ttf", 10) 
+            # 尝试加载中文字体以支持诗句显示，若无则回退
+            font = ImageFont.truetype("simhei.ttf", 14) 
         except IOError:
             font = ImageFont.load_default()
             
@@ -38,30 +44,34 @@ def draw_layout(layout_seq: List[Tuple], poem: str, output_path: str, img_size: 
             cls_id, cx, cy, w, h = item
             cls_id = int(cls_id)
             
+            # 转换归一化坐标为像素坐标
             xmin = int((cx - w / 2) * W)
             ymin = int((cy - h / 2) * H)
             xmax = int((cx + w / 2) * W)
             ymax = int((cy + h / 2) * H)
             
-            color = CLASS_COLORS.get(cls_id, "black")
+            color = CLASS_COLORS.get(cls_id, "white")
             cls_name = CLASS_NAMES.get(cls_id, "Unknown")
             
-            draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=2)
-            label_text = f"{cls_name} ({cls_id})"
-            text_y = ymin - 12 if ymin > 12 else ymin + 2
-            draw.text((xmin + 2, text_y), label_text, fill=color, font=font)
+            # 绘制实线框
+            draw.rectangle([xmin, ymin, xmax, ymax], outline=color, width=3)
+            
+            # 绘制类别标签
+            label_text = f"{cls_name}"
+            text_pos = (xmin + 2, ymin - 16 if ymin > 20 else ymin + 2)
+            draw.text(text_pos, label_text, fill=color, font=font)
         
-        draw.text((10, 10), f"Input: {poem}", fill="black", font=font)
+        # 绘制底部诗句标题
+        draw.text((10, H - 25), f"Poem: {poem}", fill="white", font=font)
+        
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         img.save(output_path)
         
-    except ImportError:
-        print("[Warning]: PIL/Pillow not found.")
     except Exception as e:
-        print(f"[Error]: {e}")
+        print(f"[Error in draw_layout]: {e}")
 
 # -------------------------------------------------------------
-# [NEW] 综合热力图绘制函数 (多层叠加)
+# [同步修改] 综合热力图绘制函数 (确保颜色与 Mask 对齐)
 # -------------------------------------------------------------
 def draw_integrated_heatmap(
     layers: List[Tuple[np.ndarray, int]], 
@@ -70,72 +80,51 @@ def draw_integrated_heatmap(
     img_size: Tuple[int, int] = (512, 512)
 ):
     """
-    将多个物体的热力图叠加到一张图中。
-    
-    Args:
-        layers: List of (grid_8x8, class_id)。
-        poem: 诗句内容（作为标题）。
-        output_path: 输出路径。
+    将多个意象的热力图按照语义颜色叠加。
     """
     try:
         W, H = img_size
-        # 初始化黑色画布 (Float类型以便累加)
-        # 形状: (H, W, 3)
         canvas = np.zeros((H, W, 3), dtype=np.float32)
         
         for grid, cls_id in layers:
-            # 1. 归一化 Grid
             grid = np.asarray(grid, dtype=np.float32)
             if grid.max() > 0:
                 grid = grid / grid.max()
             
-            # 2. 上采样 Grid 到图像尺寸 (使用最近邻插值保持块状感)
-            # 先转为 PIL Image 进行 Resize，再转回 Numpy
+            # 上采样至图像尺寸
             pil_grid = Image.fromarray(grid)
-            pil_grid = pil_grid.resize(img_size, resample=Image.NEAREST)
-            grid_large = np.array(pil_grid, dtype=np.float32) # (H, W)
+            pil_grid = pil_grid.resize(img_size, resample=Image.BILINEAR) # 稍微平滑一点
+            grid_large = np.array(pil_grid, dtype=np.float32)
             
-            # 3. 获取类别颜色
+            # 获取对应的语义颜色
             color_name = CLASS_COLORS.get(cls_id, "white")
-            rgb = ImageColor.getrgb(color_name) # (R, G, B)
+            rgb = ImageColor.getrgb(color_name) 
             
-            # 4. 叠加颜色：Canvas += Heatmap_Value * Color_RGB
-            # 这样重叠区域的亮度会增加，且颜色会混合
+            # 颜色叠加
             for c in range(3):
                 canvas[:, :, c] += grid_large * rgb[c]
 
-        # 5. 裁剪值到 [0, 255] 并转为 uint8
+        # 裁剪并量化
         canvas = np.clip(canvas, 0, 255).astype(np.uint8)
         img = Image.fromarray(canvas, mode='RGB')
         
-        # 6. 绘制网格线和标题
+        # 绘制网格线增强“骚气”感
         draw = ImageDraw.Draw(img)
-        try:
-            font = ImageFont.truetype("arial.ttf", 15)
-        except IOError:
-            font = ImageFont.load_default()
-
-        # 灰色网格线
-        grid_color = (80, 80, 80)
-        grid_w, grid_h = 8, 8 # 假设是 8x8 Grid
-        for i in range(1, grid_w):
-            x = int(i * W / grid_w)
+        grid_color = (60, 60, 60)
+        num_cells = 8
+        for i in range(1, num_cells):
+            x = int(i * W / num_cells)
             draw.line([(x, 0), (x, H)], fill=grid_color, width=1)
-        for j in range(1, grid_h):
-            y = int(j * H / grid_h)
+            y = int(i * H / num_cells)
             draw.line([(0, y), (W, y)], fill=grid_color, width=1)
 
-        # 标题 (带黑色描边的白色文字，确保在任何背景下可见)
-        text = f"Integrated Heatmap: {poem[:15]}..."
-        x, y = 10, 10
-        # 描边
-        for offset in [(-1,-1),(1,-1),(-1,1),(1,1)]: 
-            draw.text((x+offset[0], y+offset[1]), text, font=font, fill="black")
-        draw.text((x, y), text, font=font, fill="white")
+        # 标题绘制
+        text = f"Semantic Heatmap: {poem[:12]}"
+        draw.text((10, 10), text, fill="white")
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         img.save(output_path)
-        print(f"  -> Integrated heatmap saved: {output_path}")
+        print(f"  -> Semantic heatmap saved: {output_path}")
 
     except Exception as e:
-        print(f"[Error] Failed to draw integrated heatmap: {e}")
+        print(f"[Error in draw_integrated_heatmap]: {e}")
