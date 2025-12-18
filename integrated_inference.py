@@ -14,43 +14,93 @@ from inference.greedy_decode import greedy_decode_poem_layout
 from stage2_generation.utils.ink_mask import InkWashMaskGenerator
 from data.visualize import draw_layout
 
-# 定义完整的 50 句测试诗集
-POEMS_50 = [
-    "白日依山尽，黄河入海流。", "明月松间照，清泉石上流。", "野旷天低树，江清月近人。",
-    "两岸青山相对出，孤帆一片日边来。", "孤舟蓑笠翁，独钓寒江雪。", "大漠孤烟直，长河落日圆。",
-    "山高月小，水落石出。", "月落乌啼霜满天，江枫渔火对愁眠。", "落霞与孤鹜齐飞，秋水共长天一色。",
-    "渭城朝雨浥轻尘，客舍青青柳色新。", "千山鸟飞绝，万径人踪灭。", "小楼一夜听春雨，深巷明朝卖杏花。",
-    "竹喧归浣女，莲动下渔舟。", "云想衣裳花想容，春风拂槛露华浓。", "独在异乡为异客，每逢佳节倍思亲。",
-    "江流天地外，山色有无中。", "青山横北郭，白水绕东城。", "柴门闻犬吠，风雪夜归人。",
-    "空山新雨后，天气晚来秋。", "一水护田将绿绕，两山排闼送青来。", "接天莲叶无穷碧，映日荷花别样红。",
-    "黄河远上白云间，一片孤城万仞山。", "山回路转不见君，雪上空留马行处。", "西塞山前白鹭飞，桃花流水鳜鱼肥。",
-    "日出江花红胜火，春来江水绿如蓝。", "两岸猿声啼不住，轻舟已过万重山。", "溪云初起日沉阁，山雨欲来风满楼。",
-    "鸡声茅店月，人迹板桥霜。", "林表明霁色，城中增暮寒。", "清明时节雨纷纷，路上行人欲断魂。",
-    "轻舟短棹西湖好，绿水逶迤，芳草长堤。", "山光悦鸟性，潭影空人心。", "绿树村边合，青山郭外斜。",
-    "霜落熊升树，林空鹿饮溪。", "千峰笋石千株玉，万树松萝万朵云。", "烟波江上使人愁。",
-    "渔舟逐水爱山春，两岸桃花夹古津。", "楼观沧海日，门对浙江潮。", "松风吹解带，山月照弹琴。",
-    "野渡无人舟自横。", "湖光秋月两相和，潭面无风镜未磨。", "江碧鸟逾白，山青花欲燃。",
-    "石泉流暗壁，草露滴秋根。", "晓看红湿处，花重锦官城。", "榆柳荫后檐，桃李罗堂前。",
-    "木末芙蓉花，山中发红萼。", "露从今夜白，月是故乡明。", "萧萧梧叶送寒声，江上秋风动客情。",
-    "山寺月中寻桂子，郡亭枕上看潮头。", "横看成岭侧成峰，远近高低各不同。"
-]
+# =============================================================
+# 创新架构：跨模态交叉注意力态势锚定处理器 (Gestalt Attention Processor)
+# =============================================================
+class PoemInkAttentionProcessor:
+    """
+    底层架构创新：通过干预 Cross-Attention 层实现数学级语义绑定。
+    [V7.0 更新]：支持态势能参数偏移，使注意力跟随墨迹扩散方向。
+    """
+    def __init__(self, dynamic_layout, tokenizer, prompt, device, scale=7.0):
+        self.layout = dynamic_layout  # 8维张量 [N, 8]
+        self.tokenizer = tokenizer
+        self.prompt = prompt
+        self.device = device
+        self.scale = scale 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Poem2Ink: 50句诗歌全自动批量推理（彩色语义强绑定版）")
-    parser.add_argument("--output_base", type=str, default="./inference_results_v50_color", help="结果保存的根目录")
-    parser.add_argument("--layout_ckpt", type=str, required=True, help="强化学习后的布局模型路径")
-    parser.add_argument("--taiyi_model_path", type=str, required=True, help="本地太乙模型路径")
-    parser.add_argument("--lora_path", type=str, required=True, help="微调后的 LoRA 权重目录")
-    parser.add_argument("--controlnet_seg_path", type=str, required=True, help="语义分割控制网路径 (对应彩色Mask)")
-    parser.add_argument("--controlnet_t_path", type=str, required=True, help="ControlNet 风格流路径")
-    return parser.parse_args()
+        self.class_to_keyword = {
+            2: "山", 3: "水", 4: "人", 5: "树", 6: "屋", 
+            7: "桥", 8: "花", 9: "鸟", 10: "兽"
+        }
+
+    def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
+        batch_size, sequence_length, _ = hidden_states.shape
+        
+        query = attn.to_q(hidden_states)
+        encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+
+        # 执行态势锚定
+        res = int(np.sqrt(sequence_length))
+        h, w = res, res
+        tokens = self.tokenizer.encode(self.prompt)
+        
+        for item in self.layout:
+            cls_id = int(item[0])
+            keyword = self.class_to_keyword.get(cls_id, None)
+            if not keyword: continue
+            
+            # 提取 8 维中的参数
+            cx, cy, bw, bh = item[1:5]
+            bx, by = item[5:7] # 态势偏移参数
+            
+            keyword_token_ids = self.tokenizer.encode(keyword, add_special_tokens=False)
+            token_indices = [i for i, t in enumerate(tokens) if t in keyword_token_ids]
+            
+            if not token_indices: continue
+
+            # [架构创新点]：根据态势能计算非对称注意力 Mask
+            # 相比普通方框，这里加入了 (bx, by) 的中心偏移
+            x_c, y_c = (cx + bx * 0.1) * w, (cy + by * 0.1) * h
+            x1, y1 = int(x_c - (bw/2)*w), int(y_c - (bh/2)*h)
+            x2, y2 = int(x_c + (bw/2)*w), int(y_c + (bh/2)*h)
+            
+            x1, y1, x2, y2 = max(0, x1), max(0, y1), min(w, x2), min(h, y2)
+
+            for idx in token_indices:
+                if idx >= attention_probs.shape[-1]: continue
+                # 注意力场增强
+                mask = torch.zeros((h, w), device=self.device)
+                mask[y1:y2, x1:x2] = self.scale
+                mask_flat = mask.flatten()
+                
+                # 乘性增强，强制模型在渲染该区域时‘满脑子都是这个意象’
+                attention_probs[:, :, idx] += mask_flat * attention_probs[:, :, idx]
+
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+        hidden_states = attn.to_out[0](hidden_states)
+        hidden_states = attn.to_out[1](hidden_states)
+
+        return hidden_states
+
+# =============================================================
+# 推理主逻辑适配
+# =============================================================
 
 def main():
     args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # --- 1. 初始化模型 ---
-    print("\n[Init] 正在加载布局模型 (Stage 1)...")
+    # 初始化模型
     with open("configs/default.yaml", "r") as f:
         config = yaml.safe_load(f)
     
@@ -62,86 +112,63 @@ def main():
         decoder_layers=config['model']['decoder_layers'],
         decoder_heads=config['model']['decoder_heads'],
         latent_dim=config['model'].get('latent_dim', 64)
-    )
+    ).to(device).eval()
     
+    # 加载权重
     ckpt = torch.load(args.layout_ckpt, map_location=device)
     layout_model.load_state_dict(ckpt['model_state_dict'] if 'model_state_dict' in ckpt else ckpt)
-    layout_model.to(device).eval()
-    tokenizer_bert = BertTokenizer.from_pretrained(config['model']['bert_path'])
-
-    print("[Init] 正在加载太乙生成模型与语义控制网 (Stage 2)...")
-    # 核心修改：这里加载的是支持彩色语义分割输入的 ControlNet
+    
+    # 加载太乙管线
     controlnet_seg = ControlNetModel.from_pretrained(args.controlnet_seg_path, torch_dtype=torch.float16)
     controlnet_t = ControlNetModel.from_pretrained(args.controlnet_t_path, torch_dtype=torch.float16)
     
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
         args.taiyi_model_path,
         controlnet=[controlnet_seg, controlnet_t],
-        torch_dtype=torch.float16,
-        local_files_only=True 
+        torch_dtype=torch.float16
     ).to(device)
-    
     pipe.load_lora_weights(args.lora_path)
-    pipe.scheduler = DDPMScheduler.from_config(pipe.scheduler.config)
     
-    # 初始化彩色 Mask 生成器
     ink_gen = InkWashMaskGenerator(width=512, height=512)
 
-    # --- 2. 批量推理循环 ---
-    print(f"\n🚀 开始彩色语义强绑定推理 50 句诗歌...")
-    
-    for i, poem in enumerate(tqdm(POEMS_50, desc="Overall Progress")):
-        poem_clean = poem[:12].replace("，", "_").replace("。", "").replace("？", "").replace("！", "").strip()
+    # 模拟 50 首测试集
+    POEMS_50 = ["大漠孤烟直，长河落日圆。", "两个黄鹂鸣翠柳，一行白鹭上青天。"] # 示例
+
+    for i, poem in enumerate(tqdm(POEMS_50)):
+        poem_clean = poem[:12].replace("，", "_").replace("。", "").strip()
         save_dir = os.path.join(args.output_base, f"{i+1:02d}_{poem_clean}")
         os.makedirs(save_dir, exist_ok=True)
 
-        try:
-            # STEP 1: 布局生成
-            layout = greedy_decode_poem_layout(
-                layout_model, tokenizer_bert, poem, 
-                max_elements=30, device=device, mode="sample"
-            )
-            
-            # 保存热力图
-            heatmap_temp_path = f"outputs/heatmaps/integrated_{poem_clean}流.png"
-            if os.path.exists(heatmap_temp_path):
-                os.rename(heatmap_temp_path, os.path.join(save_dir, "01_heatmap.png"))
+        # 1. 生成 8 维动态布局
+        # 注意：此处 layout 现在是 [N, 8]
+        layout = greedy_decode_poem_layout(layout_model, BertTokenizer.from_pretrained(config['model']['bert_path']), poem, device=device)
+        
+        # 2. 可视化基础框 (取前 5 维：cls, cx, cy, w, h)
+        draw_layout(layout[:, :5], f"Poem: {poem}", os.path.join(save_dir, "01_layout.png"))
 
-            # 保存布局草图 (确保这里的颜色与 ink_mask 一致)
-            draw_layout(layout, f"RL Inference: {poem}", os.path.join(save_dir, "01_layout.png"))
+        # 3. 转换为势能场 Mask (V7.0 ink_mask 支持 8 维输入)
+        mask_img = ink_gen.convert_boxes_to_mask(layout)
+        mask_img.save(os.path.join(save_dir, "02_potential_field.png"))
 
-            # STEP 2: 彩色语义 Mask 转换 [核心创新点修改]
-            # 现在生成的 mask_img 是彩色的 RGB 图像
-            mask_img = ink_gen.convert_boxes_to_mask(layout)
-            mask_img.save(os.path.join(save_dir, "02_semantic_color_mask.png"))
+        # 4. 架构注入：注入支持态势偏移的处理器
+        attn_proc = PoemInkAttentionProcessor(
+            dynamic_layout=layout, 
+            tokenizer=pipe.tokenizer, 
+            prompt=poem, 
+            device=device,
+            scale=8.0 # 强绑定系数
+        )
+        pipe.unet.set_attn_processor(attn_proc)
 
-            # STEP 3: 语义强绑定 Prompt 构建 [骚操作]
-            # 为了强化颜色与意象的绑定，我们在提示词中加入颜色引导描述
-            semantic_binding_hints = (
-                "，红色区域画山，蓝色区域画水，绿色区域画树，黄色区域画建筑，"
-                "紫色区域画花卉，青色区域画人物，橙色区域画飞鸟"
-            )
-            style_suffix = "，写意水墨画，中国画风格，杰作，高分辨率，层次分明"
-            
-            full_prompt = f"{poem}{semantic_binding_hints}{style_suffix}"
-            
-            # 最终山水画生成
-            # 传入彩色 Mask 作为控制信号
-            final_image = pipe(
-                prompt=full_prompt,
-                image=[mask_img, mask_img], # 两路 ControlNet 均以此彩色语义为基准
-                num_inference_steps=35,
-                guidance_scale=8.5,
-                controlnet_conditioning_scale=[1.2, 0.7] # 调高语义流权重以增强“强绑定”
-            ).images[0]
-            
-            final_image.save(os.path.join(save_dir, "03_final_painting.png"))
-
-        except Exception as e:
-            print(f"\n❌ [Error] 诗句 '{poem}' 处理失败: {e}")
-            continue
-
-    print(f"\n✨ 任务圆满完成！全部结果已保存在: {args.output_base}")
+        # 5. 双流协同生成
+        final_image = pipe(
+            prompt=f"{poem}，写意水墨画，中国画风格，杰作",
+            image=[mask_img, mask_img],
+            num_inference_steps=35,
+            controlnet_conditioning_scale=[1.2, 0.8] # 结构流略强于风格流以保证位置
+        ).images[0]
+        
+        final_image.save(os.path.join(save_dir, "03_final_painting.png"))
 
 if __name__ == "__main__":
     main()

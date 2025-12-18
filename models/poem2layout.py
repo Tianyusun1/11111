@@ -1,4 +1,4 @@
-# models/poem2layout.py (V6.0: Disentangled Attention - Content & Pos Separated)
+# models/poem2layout.py (V7.0: Dynamic Gestalt & Aesthetic Potential Architecture)
 
 import torch
 import torch.nn as nn
@@ -6,9 +6,7 @@ import torch.nn.functional as F
 from transformers import BertModel
 from .decoder import LayoutDecoder
 
-# [REMOVED] GatedFusion class is removed as we use Disentangled Attention now.
-
-# === 1. 图神经网络关系先验 (R-GAT) (保持不变) ===
+# === 1. 图神经网络关系先验 (R-GAT) ===
 class GraphRelationPriorNet(nn.Module):
     def __init__(self, num_relations, input_dim, hidden_dim, num_heads=4, dropout=0.1):
         super().__init__()
@@ -62,7 +60,7 @@ class GraphRelationPriorNet(nn.Module):
         
         return output
 
-# === 2. 布局变换编码器 (保持不变) ===
+# === 2. 布局变换编码器 ===
 class LayoutTransformerEncoder(nn.Module):
     def __init__(self, input_dim=4, hidden_size=768, num_layers=2, nhead=4, dropout=0.1):
         super().__init__()
@@ -96,7 +94,7 @@ class LayoutTransformerEncoder(nn.Module):
             
         return global_feat
 
-# === 主模型更新: Poem2LayoutGenerator ===
+# === 主模型: Poem2LayoutGenerator ===
 class Poem2LayoutGenerator(nn.Module):
     def __init__(self, bert_path: str, num_classes: int, hidden_size: int = 768, bb_size: int = 64, 
                  decoder_layers: int = 4, decoder_heads: int = 8, dropout: float = 0.1, 
@@ -160,8 +158,6 @@ class Poem2LayoutGenerator(nn.Module):
             dropout=dropout
         )
         
-        # [REMOVED] self.fusion_gate = GatedFusion(bb_size) -> Disentangled attention doesn't need early fusion
-
         # 6. CVAE Components
         self.layout_encoder = LayoutTransformerEncoder(
             input_dim=4,
@@ -190,13 +186,23 @@ class Poem2LayoutGenerator(nn.Module):
             dropout=dropout
         )
 
-        # 9. Head
+        # === 9. 创新架构：双头预测系统 (Dual-Head Prediction) ===
         decoder_output_size = hidden_size + bb_size
+        
+        # A. 基础坐标回归头 (BBox Head)
         self.reg_head = nn.Sequential(
             nn.Linear(decoder_output_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 4)
+        )
+
+        # B. 形态态势头 (Object Gestalt Head)
+        # 预测物体的“势”：[纵向张力, 横向张力, 旋转, 洇散倾向]
+        self.gestalt_head = nn.Sequential(
+            nn.Linear(decoder_output_size, hidden_size // 2),
+            nn.Tanh(), # Tanh 保证势能偏移的有向性
+            nn.Linear(hidden_size // 2, 4)
         )
         
         # 10. Consistency Projection
@@ -245,12 +251,12 @@ class Poem2LayoutGenerator(nn.Module):
             
         z_feat = self.z_proj(z).unsqueeze(1) 
 
-        # === [MODIFIED] Disentangled Stream Construction ===
+        # === Disentangled Stream Construction ===
         
-        # 1. Content Stream: Base Semantics + CVAE Latent
+        # 1. Content Stream
         layout_content = content_embed + z_feat 
 
-        # 2. Position Stream: Handcrafted + Learned + Sequence Pos
+        # 2. Position Stream
         pos_feat = torch.zeros_like(content_embed)
         
         if location_grids is not None:
@@ -268,7 +274,6 @@ class Poem2LayoutGenerator(nn.Module):
             col_idx = gather_ids.view(B, 1, T).expand(-1, T, -1)
             seq_rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx]
             
-            # GNN uses content to infer spatial relations, outputting spatial features
             learned_pos = self.gnn_prior(content_embed, seq_rel_ids)
             pos_feat = pos_feat + learned_pos 
 
@@ -280,9 +285,6 @@ class Poem2LayoutGenerator(nn.Module):
         
         # Final Position Stream
         layout_pos = pos_feat + seq_embed
-        
-        # [REMOVED] Early Fusion Gate
-        # layout_embed = self.fusion_gate(content_embed, pos_feat) ...
 
         src_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         if padding_mask is not None:
@@ -295,7 +297,6 @@ class Poem2LayoutGenerator(nn.Module):
         spatial_bias = self.construct_spatial_bias(kg_class_ids, kg_spatial_matrix)
 
         # decoder_output shape: [B, T, hidden_size + bb_size]
-        # [MODIFIED] Pass split streams to decoder
         decoder_output = self.layout_decoder(
             layout_content, # Content Stream
             layout_pos,     # Position Stream
@@ -305,67 +306,86 @@ class Poem2LayoutGenerator(nn.Module):
             spatial_bias=spatial_bias
         ) 
 
+        # === 核心输出重构 ===
+        # 1. 预测基础坐标
         pred_boxes = torch.sigmoid(self.reg_head(decoder_output))
         
-        return mu, logvar, pred_boxes, decoder_output
+        # 2. 预测意象态势 (Dynamic Gestalt)
+        # bias_x, bias_y, rotation, flow
+        pred_gestalt = self.gestalt_head(decoder_output)
+        
+        # 拼接输出，形成 [B, T, 8] 的动态布局张量
+        dynamic_layout = torch.cat([pred_boxes, pred_gestalt], dim=-1)
+        
+        return mu, logvar, dynamic_layout, decoder_output
 
     def forward_rl(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
                    kg_spatial_matrix=None, location_grids=None, target_boxes=None, 
                    sample=True):
         """
-        RL 专用的前向传播。
+        RL 专用的前向传播，返回动态布局动作。
         """
-        _, _, pred_boxes_mu, _ = self.forward(
+        _, _, dynamic_layout_mu, _ = self.forward(
             input_ids, attention_mask, kg_class_ids, padding_mask, 
             kg_spatial_matrix, location_grids, target_boxes=None
         )
         
         if not sample:
-            return pred_boxes_mu, None
+            return dynamic_layout_mu, None
 
-        std = torch.ones_like(pred_boxes_mu) * 0.1
-        dist = torch.distributions.Normal(pred_boxes_mu, std)
+        std = torch.ones_like(dynamic_layout_mu) * 0.1
+        dist = torch.distributions.Normal(dynamic_layout_mu, std)
         
-        action_boxes = dist.sample()
-        action_boxes = torch.clamp(action_boxes, 0.0, 1.0)
+        action_layout = dist.sample()
+        # 坐标部分 clamp [0, 1]，态势部分保持原样
+        coords = torch.clamp(action_layout[..., :4], 0.0, 1.0)
+        gestalt = action_layout[..., 4:]
+        final_action = torch.cat([coords, gestalt], dim=-1)
         
-        log_prob = dist.log_prob(action_boxes).sum(dim=-1)
+        log_prob = dist.log_prob(final_action).sum(dim=-1)
         
         if padding_mask is not None:
              log_prob = log_prob.masked_fill(padding_mask, 0.0)
 
-        return action_boxes, log_prob
+        return final_action, log_prob
 
     def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None, decoder_output=None):
+        """
+        注意：pred_boxes 此时是 forward 返回的 8 维 dynamic_layout。
+        坐标计算仅取前 4 维。
+        """
         loss_mask = layout_mask 
-        target_boxes = target_coords_gt
+        target_boxes = target_coords_gt # GT 只有 4 维
+        
+        # 提取预测的坐标部分
+        pred_coords = pred_boxes[..., :4]
         
         if loss_mask.dim() == 1:
-             loss_mask = loss_mask.view(pred_boxes.shape[0], -1)
+             loss_mask = loss_mask.view(pred_coords.shape[0], -1)
         
         num_valid = loss_mask.sum().clamp(min=1)
 
-        loss_reg = F.smooth_l1_loss(pred_boxes, target_boxes, reduction='none') 
+        loss_reg = F.smooth_l1_loss(pred_coords, target_boxes, reduction='none') 
         loss_reg = (loss_reg.mean(dim=-1) * loss_mask).sum() / num_valid
         
-        loss_iou = self._compute_iou_loss(pred_boxes, target_boxes, loss_mask)
+        loss_iou = self._compute_iou_loss(pred_coords, target_boxes, loss_mask)
         
-        pred_w, pred_h = pred_boxes[..., 2], pred_boxes[..., 3]
+        pred_w, pred_h = pred_coords[..., 2], pred_coords[..., 3]
         tgt_w, tgt_h = target_boxes[..., 2], target_boxes[..., 3]
         pred_area = pred_w * pred_h
         tgt_area = tgt_w * tgt_h
         loss_area = F.smooth_l1_loss(pred_area, tgt_area, reduction='none')
         loss_area = (loss_area * loss_mask).sum() / num_valid
         
-        loss_relation = self._compute_relation_loss(pred_boxes, loss_mask, kg_spatial_matrix, kg_class_ids)
-        loss_overlap = self._compute_overlap_loss(pred_boxes, loss_mask, kg_spatial_matrix, kg_class_ids)
+        loss_relation = self._compute_relation_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
+        loss_overlap = self._compute_overlap_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
         
-        loss_size_prior = self._compute_size_loss(pred_boxes, loss_mask, num_boxes, kg_class_weights)
+        loss_size_prior = self._compute_size_loss(pred_coords, loss_mask, num_boxes, kg_class_weights)
 
-        loss_alignment = self._compute_alignment_loss(pred_boxes, loss_mask)
-        loss_balance = self._compute_balance_loss(pred_boxes, loss_mask)
+        loss_alignment = self._compute_alignment_loss(pred_coords, loss_mask)
+        loss_balance = self._compute_balance_loss(pred_coords, loss_mask)
         
-        loss_clustering = self._compute_clustering_loss(pred_boxes, loss_mask, kg_class_ids)
+        loss_clustering = self._compute_clustering_loss(pred_coords, loss_mask, kg_class_ids)
 
         loss_consistency = self._compute_consistency_loss(decoder_output, loss_mask)
 
@@ -385,25 +405,19 @@ class Poem2LayoutGenerator(nn.Module):
                loss_alignment, loss_balance, loss_clustering, loss_consistency
 
     def _compute_consistency_loss(self, decoder_output, mask):
-        """
-        计算双流一致性损失。
-        Decoder输出是 [text_stream, layout_stream] 的拼接。
-        """
         if decoder_output is None:
             return torch.tensor(0.0, device=mask.device)
         
-        # decoder_output: [B, T, hidden_size + bb_size]
-        text_stream_feat = decoder_output[..., :self.hidden_size] # [B, T, hidden]
-        layout_stream_feat = decoder_output[..., self.hidden_size:] # [B, T, bb]
+        text_stream_feat = decoder_output[..., :self.hidden_size] 
+        layout_stream_feat = decoder_output[..., self.hidden_size:] 
         
-        layout_projected = self.consistency_proj(layout_stream_feat) # [B, T, hidden]
+        layout_projected = self.consistency_proj(layout_stream_feat) 
         
         text_norm = F.normalize(text_stream_feat, p=2, dim=-1)
         layout_norm = F.normalize(layout_projected, p=2, dim=-1)
         
-        cosine_sim = (text_norm * layout_norm).sum(dim=-1) # [B, T]
+        cosine_sim = (text_norm * layout_norm).sum(dim=-1) 
         loss = 1.0 - cosine_sim
-        
         loss = (loss * mask).sum() / mask.sum().clamp(min=1)
         
         return loss
