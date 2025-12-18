@@ -1,0 +1,100 @@
+# File: tianyusun1/test2/test2-5.2/configs/default.yaml (V5.18: Final Optimized for RL Stability & 6K Data)
+
+model:
+  # BERT encoder
+  bert_path: "/home/610-sty/huggingface/bert-base-chinese"
+  hidden_size: 768
+  # Layout decoder
+  bb_size: 128            
+  decoder_layers: 6
+  decoder_heads: 8
+  dropout: 0.3
+  # Output
+  num_classes: 9
+  
+  # === CVAE Parameters ===
+  latent_dim: 64          
+
+  # --- Legacy Discrete Parameters ---
+  num_bbox_bins: 1000
+  cls_embed_dim: 32
+  bbox_embed_dim: 24
+  # -----------------------------------------------------------
+
+  # === LOSS WEIGHTS (SUPERVISED STAGE) ===
+  # 1. 基础重建
+  reg_loss_weight: 1.0      
+  iou_loss_weight: 1.0      
+  area_loss_weight: 1.0     
+  
+  # 2. 逻辑与空间约束 (KG增强)
+  relation_loss_weight: 5.0 
+  overlap_loss_weight: 3.0  
+  size_loss_weight: 2.0     
+  
+  # 3. 聚类约束 (Clustering)
+  clustering_loss_weight: 1.0
+  consistency_loss_weight: 1.0
+
+  # 4. 审美约束 (Aesthetic)
+  alignment_loss_weight: 0.0 
+  balance_loss_weight: 0.0   
+  
+  # Legacy weights
+  coord_loss_weight: 0.0    
+  cls_loss_weight: 0.0      
+  count_loss_weight: 0.0    
+
+  # Inference
+  max_elements: 30
+  
+  # Data paths (Updated for 610-sty environment)
+  xlsx_path: "/home/610-sty/layout2paint/dataset/6800poems.xlsx"
+  images_dir: "/home/610-sty/layout2paint/dataset/6800"
+  labels_dir: "/home/610-sty/layout2paint/dataset/6800/JPEGImages-pre_new_txt"
+  max_layout_length: 30
+  max_text_length: 64
+
+training:
+  # === Stage 1: Supervised Pre-training ===
+  batch_size: 128         
+  epochs: 200             
+  learning_rate: 0.0001
+  warmup_steps: 1000      
+  
+  # Logging & Saving
+  save_every: 50          
+  output_dir: "./outputs/train1"
+  log_steps: 10
+  visualize_every: 5      
+
+  # === Stage 2: RL Fine-tuning Configuration (CRITICAL UPDATES) ===
+  # [修改点 1] 学习率适度调高 (2e-5)，打破"死守中心"的僵局
+  rl_epochs: 200          
+  rl_learning_rate: 2e-5  # 保持微小的学习率，但比 5e-6 大，允许参数变动
+  
+  # RL Rewards Weights (可以在这里集中管理)
+  reward_weights:
+    iou: 2.0              # [核心] 保持高权重，稳住有标注的数据
+    
+    # [关键修改] 大幅提高关系奖励 (5.0)，强迫模型"读懂"诗句逻辑
+    # 这是防止模型忽略输入、生成千篇一律布局的关键
+    relation: 5.0         
+    
+    # [修改点 2] 保持较低的分散度权重 (0.5)
+    # 代码中已改为计算"最近邻距离"，配合 0.5 的权重即可实现"不堆叠"且"不贴角"
+    dispersion: 0.5       
+    
+    overlap: -0.5         # 惩罚重叠 (负分)
+
+inference:
+  max_output_length: 30
+
+
+
+#python scripts/train.py
+# python scripts/train.py \
+#     --rl_tuning \
+#     --checkpoint outputs/model_best_val_loss_1.234.pth
+
+#python scripts/infer.py --num_samples 5 --mode sample
