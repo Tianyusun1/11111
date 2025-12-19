@@ -1,4 +1,4 @@
-# models/poem2layout.py (V7.0: Dynamic Gestalt & Aesthetic Potential Architecture)
+# models/poem2layout.py (V8.0: Data-Driven Gestalt Supervision)
 
 import torch
 import torch.nn as nn
@@ -106,6 +106,7 @@ class Poem2LayoutGenerator(nn.Module):
                  balance_loss_weight: float = 0.5,
                  clustering_loss_weight: float = 1.0, 
                  consistency_loss_weight: float = 1.0, 
+                 gestalt_loss_weight: float = 2.0, # [NEW V8.0] 态势自监督损失权重
                  latent_dim: int = 32,               
                  **kwargs): 
         super(Poem2LayoutGenerator, self).__init__()
@@ -126,6 +127,7 @@ class Poem2LayoutGenerator(nn.Module):
         self.balance_loss_weight = balance_loss_weight
         self.clustering_loss_weight = clustering_loss_weight
         self.consistency_loss_weight = consistency_loss_weight
+        self.gestalt_loss_weight = gestalt_loss_weight # [NEW]
         
         self.cond_dropout = nn.Dropout(0.25)
 
@@ -160,7 +162,7 @@ class Poem2LayoutGenerator(nn.Module):
         
         # 6. CVAE Components
         self.layout_encoder = LayoutTransformerEncoder(
-            input_dim=4,
+            input_dim=4, # Encoder 仍然只看坐标，Latent Space 聚焦于结构
             hidden_size=hidden_size,
             num_layers=2,
             nhead=4,
@@ -198,10 +200,11 @@ class Poem2LayoutGenerator(nn.Module):
         )
 
         # B. 形态态势头 (Object Gestalt Head)
-        # 预测物体的“势”：[纵向张力, 横向张力, 旋转, 洇散倾向]
+        # 预测: [bias_x, bias_y, rotation, flow]
+        # 使用 Tanh 将输出限制在 [-1, 1]，匹配 dataset 中归一化后的特征范围
         self.gestalt_head = nn.Sequential(
             nn.Linear(decoder_output_size, hidden_size // 2),
-            nn.Tanh(), # Tanh 保证势能偏移的有向性
+            nn.Tanh(), 
             nn.Linear(hidden_size // 2, 4)
         )
         
@@ -239,7 +242,10 @@ class Poem2LayoutGenerator(nn.Module):
         content_embed = self.cond_dropout(content_embed)
         
         if target_boxes is not None:
-            global_layout_feat = self.layout_encoder(target_boxes, mask=padding_mask) 
+            # [CRITICAL] CVAE Encoder 只需要几何信息来构建 Latent
+            # target_boxes 可能是 8 维 (含 Gestalt)，切片取前 4 维 (cx, cy, w, h)
+            target_geom = target_boxes[..., :4]
+            global_layout_feat = self.layout_encoder(target_geom, mask=padding_mask) 
             mu = self.mu_head(global_layout_feat)
             logvar = self.logvar_head(global_layout_feat)
             z = self.reparameterize(mu, logvar)
@@ -252,11 +258,7 @@ class Poem2LayoutGenerator(nn.Module):
         z_feat = self.z_proj(z).unsqueeze(1) 
 
         # === Disentangled Stream Construction ===
-        
-        # 1. Content Stream
         layout_content = content_embed + z_feat 
-
-        # 2. Position Stream
         pos_feat = torch.zeros_like(content_embed)
         
         if location_grids is not None:
@@ -273,17 +275,13 @@ class Poem2LayoutGenerator(nn.Module):
             row_idx = gather_ids.view(B, T, 1).expand(-1, -1, T)
             col_idx = gather_ids.view(B, 1, T).expand(-1, T, -1)
             seq_rel_ids = kg_spatial_matrix[b_idx, row_idx, col_idx]
-            
             learned_pos = self.gnn_prior(content_embed, seq_rel_ids)
             pos_feat = pos_feat + learned_pos 
 
         pos_feat = self.cond_dropout(pos_feat)
-
         B, T = kg_class_ids.shape
         seq_ids = torch.arange(T, device=kg_class_ids.device).unsqueeze(0).expand(B, -1)
         seq_embed = self.seq_pos_embedding(seq_ids) 
-        
-        # Final Position Stream
         layout_pos = pos_feat + seq_embed
 
         src_mask = attention_mask.unsqueeze(1).unsqueeze(2)
@@ -296,25 +294,18 @@ class Poem2LayoutGenerator(nn.Module):
 
         spatial_bias = self.construct_spatial_bias(kg_class_ids, kg_spatial_matrix)
 
-        # decoder_output shape: [B, T, hidden_size + bb_size]
         decoder_output = self.layout_decoder(
-            layout_content, # Content Stream
-            layout_pos,     # Position Stream
-            text_encoded, 
-            src_mask, 
-            trg_mask,
-            spatial_bias=spatial_bias
+            layout_content, layout_pos, text_encoded, 
+            src_mask, trg_mask, spatial_bias=spatial_bias
         ) 
 
-        # === 核心输出重构 ===
-        # 1. 预测基础坐标
+        # === Outputs ===
         pred_boxes = torch.sigmoid(self.reg_head(decoder_output))
         
-        # 2. 预测意象态势 (Dynamic Gestalt)
-        # bias_x, bias_y, rotation, flow
+        # Gestalt Head Output: 范围 [-1, 1] (Tanh)
+        # 这对应 Dataset V8.0 中归一化后的 [bias_x, bias_y, rotation, flow]
         pred_gestalt = self.gestalt_head(decoder_output)
         
-        # 拼接输出，形成 [B, T, 8] 的动态布局张量
         dynamic_layout = torch.cat([pred_boxes, pred_gestalt], dim=-1)
         
         return mu, logvar, dynamic_layout, decoder_output
@@ -322,9 +313,6 @@ class Poem2LayoutGenerator(nn.Module):
     def forward_rl(self, input_ids, attention_mask, kg_class_ids, padding_mask, 
                    kg_spatial_matrix=None, location_grids=None, target_boxes=None, 
                    sample=True):
-        """
-        RL 专用的前向传播，返回动态布局动作。
-        """
         _, _, dynamic_layout_mu, _ = self.forward(
             input_ids, attention_mask, kg_class_ids, padding_mask, 
             kg_spatial_matrix, location_grids, target_boxes=None
@@ -337,11 +325,12 @@ class Poem2LayoutGenerator(nn.Module):
         dist = torch.distributions.Normal(dynamic_layout_mu, std)
         
         action_layout = dist.sample()
-        # 坐标部分 clamp [0, 1]，态势部分保持原样
+        # 坐标部分 clamp [0, 1]
         coords = torch.clamp(action_layout[..., :4], 0.0, 1.0)
+        # 态势部分保持梯度，不强行 clamp
         gestalt = action_layout[..., 4:]
-        final_action = torch.cat([coords, gestalt], dim=-1)
         
+        final_action = torch.cat([coords, gestalt], dim=-1)
         log_prob = dist.log_prob(final_action).sum(dim=-1)
         
         if padding_mask is not None:
@@ -351,20 +340,31 @@ class Poem2LayoutGenerator(nn.Module):
 
     def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None, decoder_output=None):
         """
-        注意：pred_boxes 此时是 forward 返回的 8 维 dynamic_layout。
-        坐标计算仅取前 4 维。
+        [V8.0 Updated] 支持 8 维 GT 的混合监督训练
         """
         loss_mask = layout_mask 
-        target_boxes = target_coords_gt # GT 只有 4 维
         
-        # 提取预测的坐标部分
+        # [CRITICAL FIX] 数据解耦：拆分坐标与态势
+        # pred_boxes: [B, T, 8] -> (coords, gestalt)
         pred_coords = pred_boxes[..., :4]
+        pred_gestalt = pred_boxes[..., 4:]
+        
+        # 检查 target_coords_gt 维度
+        has_gestalt_gt = False
+        if target_coords_gt.shape[-1] >= 8:
+            target_boxes = target_coords_gt[..., :4]
+            target_gestalt = target_coords_gt[..., 4:]
+            has_gestalt_gt = True
+        else:
+            target_boxes = target_coords_gt
+            target_gestalt = None
         
         if loss_mask.dim() == 1:
              loss_mask = loss_mask.view(pred_coords.shape[0], -1)
         
         num_valid = loss_mask.sum().clamp(min=1)
 
+        # 1. 基础几何损失 (坐标回归)
         loss_reg = F.smooth_l1_loss(pred_coords, target_boxes, reduction='none') 
         loss_reg = (loss_reg.mean(dim=-1) * loss_mask).sum() / num_valid
         
@@ -377,17 +377,23 @@ class Poem2LayoutGenerator(nn.Module):
         loss_area = F.smooth_l1_loss(pred_area, tgt_area, reduction='none')
         loss_area = (loss_area * loss_mask).sum() / num_valid
         
+        # 2. 高级布局损失
         loss_relation = self._compute_relation_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
         loss_overlap = self._compute_overlap_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
-        
         loss_size_prior = self._compute_size_loss(pred_coords, loss_mask, num_boxes, kg_class_weights)
-
         loss_alignment = self._compute_alignment_loss(pred_coords, loss_mask)
         loss_balance = self._compute_balance_loss(pred_coords, loss_mask)
-        
         loss_clustering = self._compute_clustering_loss(pred_coords, loss_mask, kg_class_ids)
-
         loss_consistency = self._compute_consistency_loss(decoder_output, loss_mask)
+
+        # 3. [NEW V8.0] 自监督态势损失 (Gestalt Supervision)
+        loss_gestalt = torch.tensor(0.0, device=pred_boxes.device)
+        if has_gestalt_gt:
+            # 预测值与真实提取值均为 [-1, 1] 左右的归一化数值
+            # 计算 bias_x, bias_y, rotation 的误差
+            loss_g_vec = F.smooth_l1_loss(pred_gestalt, target_gestalt, reduction='none')
+            loss_gestalt_val = loss_g_vec.mean(dim=-1)
+            loss_gestalt = (loss_gestalt_val * loss_mask).sum() / num_valid
 
         total_loss = self.reg_loss_weight * loss_reg + \
                      self.iou_loss_weight * loss_iou + \
@@ -398,7 +404,8 @@ class Poem2LayoutGenerator(nn.Module):
                      self.alignment_loss_weight * loss_alignment + \
                      self.balance_loss_weight * loss_balance + \
                      self.clustering_loss_weight * loss_clustering + \
-                     self.consistency_loss_weight * loss_consistency 
+                     self.consistency_loss_weight * loss_consistency + \
+                     self.gestalt_loss_weight * loss_gestalt # [Added]
                      
         return total_loss, loss_relation, loss_overlap, \
                loss_reg, loss_iou, loss_size_prior, loss_area, \

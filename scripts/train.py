@@ -1,4 +1,4 @@
-# scripts/train.py (V6.0: Adapted for Disentangled Attention & Consistency Loss)
+# scripts/train.py (V8.0: Adapted for Visual Gestalt Supervision)
 
 # --- 强制添加项目根目录到 Python 模块搜索路径 ---
 import sys
@@ -117,7 +117,7 @@ def main():
     print(f"Calculated Class Weights (Internal 0:EOS, 1-9:Elements 2-10): {class_weights_tensor.tolist()}")
     # ---------------------------
 
-    # 3. Init model (传入所有损失权重，包括新增的 Consistency Loss)
+    # 3. Init model (传入所有损失权重，包括新增的 Gestalt Loss Weight)
     print(f"Initializing model with latent_dim={model_config.get('latent_dim', 32)}...")
     model = Poem2LayoutGenerator(
         bert_path=model_config['bert_path'],
@@ -155,8 +155,12 @@ def main():
         # [V5.4] 聚类损失权重
         clustering_loss_weight=model_config.get('clustering_loss_weight', 1.0),
 
-        # [NEW V6.0] 一致性损失权重 (Innovation A: Disentangled Attention & Consistency)
+        # [NEW V6.0] 一致性损失权重
         consistency_loss_weight=model_config.get('consistency_loss_weight', 1.0),
+        
+        # [NEW V8.0] 视觉态势损失权重 (Visual Gestalt Supervision)
+        # 默认 2.0, 确保模型重视从原图提取出的物理规律
+        gestalt_loss_weight=model_config.get('gestalt_loss_weight', 2.0),
         
         class_weights=class_weights_tensor 
         # -----------------------------------------
@@ -174,7 +178,7 @@ def main():
     )
     print(f"Dataset split: Train={train_size}, Validation={val_size}, Test={test_size}")
 
-    # [NOTE] Batch Size 读取自配置文件，请确保 yaml 中 batch_size 已设置为 128
+    # [NOTE] Batch Size 读取自配置文件
     batch_size = train_config['batch_size']
     print(f"Using Batch Size: {batch_size}")
 
@@ -210,7 +214,6 @@ def main():
     example_poem = dataset.data[example_idx_in_full_dataset]
     
     # **打印固定推理样例的 KG 向量和空间矩阵**
-    # 这对于调试 RL 是否能获取到 Relation Reward 非常重要
     print("\n---------------------------------------------------")
     print(f"Inference Example Poem: '{example_poem['poem']}'")
     print(f"Inference Example GT Boxes: {example_poem['boxes']}")
@@ -243,8 +246,7 @@ def main():
         checkpoint = torch.load(args.checkpoint, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         
-        # 2. 读取 RL 配置参数 [FIXED: 强制类型转换]
-        # 务必转为 float 和 int，防止 YAML 解析为 string 导致 optimizer 报错
+        # 2. 读取 RL 配置参数
         rl_lr = float(train_config.get('rl_learning_rate', 5e-6))
         rl_epochs = int(train_config.get('rl_epochs', 50))
         
@@ -266,8 +268,6 @@ def main():
             avg_reward = trainer.train_rl_epoch(epoch)
             
             # [NEW] 可视化：每轮 RL 结束生成一张样例图，直观看到模型变化
-            # print(f"--- Visualizing RL Progress (Epoch {epoch+1}) ---")
-            # 调用 Trainer 内部的推理函数，它会生成 png 到 outputs/
             trainer._run_inference_example(epoch)
             
             # === [NEW] 保存逻辑 A: 保存最棒的模型 (Best Reward) ===

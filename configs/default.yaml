@@ -44,7 +44,7 @@ model:
 training:
   # === Stage 1: Supervised Pre-training ===
   batch_size: 128         
-  epochs: 200             
+  epochs: 100             
   learning_rate: 0.0001
   warmup_steps: 1000      
   

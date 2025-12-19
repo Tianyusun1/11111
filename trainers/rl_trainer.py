@@ -1,4 +1,4 @@
-# File: trainers/rl_trainer.py (V7.0: Dynamic Gestalt & Cross-Modal Attention Alignment)
+# File: trainers/rl_trainer.py (V8.0: Pure Data-Driven RL & Crash Fix)
 
 import torch
 import torch.nn.functional as F
@@ -13,12 +13,11 @@ from trainers.loss import compute_kl_loss
 
 class RLTrainer(LayoutTrainer):
     """
-    创新架构训练器：支持动态态势预测与交叉注意力对齐。
+    [V8.0 Upgrade] 纯数据驱动 RL 训练器
     
-    [V7.0 Updates]
-    1. 适配 8 维动作空间 (Coordinates + Gestalt Potential)。
-    2. 新增 Semantic_Alignment_Reward：利用 Cross-Attention Map 约束语义位置。
-    3. 适配双头预测模型输出。
+    1. 移除了所有人为硬编码的“态势奖励” (Gestalt Reward)，完全信任模型从原图学到的物理规律。
+    2. 修复了 get_loss 解包数量不匹配导致的崩溃问题 (适配 12 个返回值)。
+    3. 专注于优化“空间布局合理性” (Overlap, Relation, Alignment)，而将“笔墨物理”留给监督头。
     """
     def __init__(self, model, train_loader, val_loader, config, tokenizer, example_poem, test_loader):
         super().__init__(model, train_loader, val_loader, config, tokenizer, example_poem, test_loader)
@@ -27,64 +26,86 @@ class RLTrainer(LayoutTrainer):
         self.rl_lr = float(config['training'].get('rl_learning_rate', 5e-6))
         self.optimizer = optim.AdamW(self.model.parameters(), lr=self.rl_lr)
         
-        # 奖励权重增加“空间对齐”项
+        # 奖励权重配置
         reward_cfg = config['training'].get('reward_weights', {})
         self.w_iou = float(reward_cfg.get('iou', 2.0))              
         self.w_rel = float(reward_cfg.get('relation', 5.0)) 
-        self.w_align = float(reward_cfg.get('alignment', 8.0)) # [NEW] 语义-注意力强绑定权重
-        self.w_overlap = float(reward_cfg.get('overlap', -1.0))     
+        self.w_align = float(reward_cfg.get('alignment', 8.0)) 
+        
+        # 激进的重叠惩罚 (保留 V7.3 的防堆叠逻辑)
+        cfg_overlap = float(reward_cfg.get('overlap', -1.0))
+        if cfg_overlap > -5.0: 
+            self.w_overlap = -15.0
+        else:
+            self.w_overlap = cfg_overlap
 
         self.last_reward_stats = {}
         self.reward_history = []
         self.plot_path_reward = os.path.join(self.output_dir, "rl_reward_trajectory.png")
 
-        print(f"[RLTrainer V7.0] Gestalt Action Space & Attention Locking Enabled.")
+        print(f"[RLTrainer V8.0] Data-Driven Mode. Hard-coded Gestalt Rules REMOVED.")
 
     def compute_reward(self, dynamic_layout, batch, attention_maps=None):
         """
-        计算奖励。注意：dynamic_layout 是 8 维的。
+        计算奖励。
+        注意：V8.0 不再对 'gestalt' (后4维) 进行人工规则奖励，
+        只关注几何合理性 (IoU, Relation, Overlap) 和 语义对齐 (Alignment)。
         """
         B, T, _ = dynamic_layout.shape
         device = dynamic_layout.device
         
         # 提取基础坐标 (前 4 维)
         pred_boxes = dynamic_layout[..., :4]
-        # 提取态势参数 (后 4 维: bx, by, rot, flow)
-        gestalt_params = dynamic_layout[..., 4:]
+        # 态势参数 (后 4 维) - RL 阶段不再直接干预它，让它保持预训练的分布
+        # gestalt_params = dynamic_layout[..., 4:] 
         
         loss_mask = batch['loss_mask']          
-        target_boxes = batch['target_boxes']
-        kg_spatial_matrix = batch['kg_spatial_matrix'] 
+        target_boxes = batch['target_boxes'][..., :4] # 仅对比坐标部分
+        kg_spatial_matrix = batch.get('kg_spatial_matrix')
         kg_class_ids = batch['kg_class_ids']    
         
         obj_rewards = torch.zeros(B, T, device=device)
         
-        # 1. 基础 IoU 奖励 (坐标对齐)
+        # --- 1. 计算各项原始奖励 ---
+        
+        # A. IoU 奖励 (保底，防止位置跑偏太远)
         iou = self._calculate_iou(pred_boxes, target_boxes)
         r_iou = iou * loss_mask * self.w_iou
-        obj_rewards += r_iou
 
-        # 2. 关系逻辑奖励 (KG 约束)
-        rel_scores = self._calculate_relation_reward(pred_boxes, kg_spatial_matrix, kg_class_ids)
-        r_rel = rel_scores * self.w_rel
-        obj_rewards += r_rel
+        # B. 关系奖励 (Full Vectorized)
+        r_rel = torch.zeros(B, T, device=device)
+        if kg_spatial_matrix is not None:
+            rel_scores = self._calculate_relation_reward(pred_boxes, kg_spatial_matrix, kg_class_ids)
+            r_rel = rel_scores * self.w_rel
 
-        # 3. [创新点] 语义一致性奖励 (Attention-to-Box Alignment)
-        # 如果模型在某物体框外产生了过高的注意力响应，给予严厉惩罚
+        # C. 语义对齐奖励 (Attention Alignment)
         r_align = torch.zeros(B, T, device=device)
         if attention_maps is not None:
-            # attention_maps shape: [B, T, H, W] (通过抽取 U-Net Cross-Attention 得到)
             r_align = self._calculate_attention_alignment(attention_maps, pred_boxes)
-            obj_rewards += r_align * self.w_align
+            r_align = r_align * self.w_align
 
-        # 4. 态势能量奖励 (Gestalt Potential Reward)
-        # 鼓励‘山’产生纵向势能，‘水’产生横向势能
-        r_gestalt = self._calculate_gestalt_reward(gestalt_params, kg_class_ids)
-        obj_rewards += r_gestalt * 1.5
+        # D. [REMOVED] 态势奖励 (Gestalt Reward)
+        # V8.0: 删除人工规则，信任 VisualGestaltExtractor 的监督结果
+        # r_gestalt = torch.zeros(B, T, device=device)
 
-        # 5. 重叠惩罚
+        # --- 2. 计算重叠惩罚 & 熔断系数 ---
+        
+        # 重叠惩罚 [B, T]
         overlap_penalty = self._calculate_overlap_penalty(pred_boxes)
-        r_over = overlap_penalty * self.w_overlap
+        
+        # Veto Factor (熔断系数)
+        # 严重重叠时，强制降低其他正向奖励的权重，迫使模型优先解决重叠
+        veto_factor = (1.0 - overlap_penalty * 2.5).clamp(min=0.0)
+        
+        # --- 3. 汇总 ---
+        
+        obj_rewards += r_iou 
+        obj_rewards += r_rel * veto_factor
+        obj_rewards += r_align * veto_factor
+        # obj_rewards += r_gestalt * veto_factor # 已移除
+        
+        # 加上重叠惩罚 (负分)
+        r_over = overlap_penalty * self.w_overlap 
         obj_rewards += r_over
 
         # 记录明细
@@ -92,32 +113,152 @@ class RLTrainer(LayoutTrainer):
             'IoU': r_iou.mean().item(),
             'Rel': r_rel.mean().item(),
             'Align': r_align.mean().item(),
-            'Gestalt': r_gestalt.mean().item(),
-            'Over': r_over.mean().item()
+            'Over': r_over.mean().item(),
+            'Veto': veto_factor.mean().item()
         }
 
         return obj_rewards.sum(dim=1) / (T + 1e-6)
 
+    def _calculate_iou(self, pred, target):
+        """计算预测框与GT的IoU"""
+        # pred: [B, T, 4], target: [B, T, 4]
+        pred_x1 = pred[..., 0] - pred[..., 2] / 2
+        pred_y1 = pred[..., 1] - pred[..., 3] / 2
+        pred_x2 = pred[..., 0] + pred[..., 2] / 2
+        pred_y2 = pred[..., 1] + pred[..., 3] / 2
+        
+        tgt_x1 = target[..., 0] - target[..., 2] / 2
+        tgt_y1 = target[..., 1] - target[..., 3] / 2
+        tgt_x2 = target[..., 0] + target[..., 2] / 2
+        tgt_y2 = target[..., 1] + target[..., 3] / 2
+        
+        inter_x1 = torch.max(pred_x1, tgt_x1)
+        inter_y1 = torch.max(pred_y1, tgt_y1)
+        inter_x2 = torch.min(pred_x2, tgt_x2)
+        inter_y2 = torch.min(pred_y2, tgt_y2)
+        
+        inter_area = (inter_x2 - inter_x1).clamp(min=0) * (inter_y2 - inter_y1).clamp(min=0)
+        
+        pred_area = pred[..., 2] * pred[..., 3]
+        tgt_area = target[..., 2] * target[..., 3]
+        union_area = pred_area + tgt_area - inter_area
+        
+        return inter_area / (union_area + 1e-6)
+
+    def _calculate_relation_reward(self, pred_boxes, kg_spatial_matrix, kg_class_ids):
+        """
+        [完备版] 全向量化关系奖励计算。
+        能够并行处理 Above(1), Below(2), Inside(3), OnTop(5) 等关系。
+        """
+        if kg_spatial_matrix is None or kg_class_ids is None:
+            return torch.zeros(pred_boxes.shape[:2], device=pred_boxes.device)
+
+        B, T, _ = pred_boxes.shape
+        device = pred_boxes.device
+
+        # 1. 构建当前序列的成对关系矩阵 [B, T, T]
+        # kg_class_ids: [B, T] -> 映射到 indices (0-8)
+        cls_indices = (kg_class_ids - 2).clamp(min=0, max=8).long()
+        
+        row_idx = cls_indices.unsqueeze(2).expand(B, T, T) # [B, T, T] (Source)
+        col_idx = cls_indices.unsqueeze(1).expand(B, T, T) # [B, T, T] (Target)
+        
+        batch_idx = torch.arange(B, device=device).view(B, 1, 1).expand(B, T, T)
+        rel_matrix_seq = kg_spatial_matrix[batch_idx, row_idx, col_idx] # [B, T, T]
+        
+        # 2. 准备几何参数用于广播计算
+        cx = pred_boxes[..., 0]
+        cy = pred_boxes[..., 1]
+        w  = pred_boxes[..., 2]
+        h  = pred_boxes[..., 3]
+        
+        # 扩展维度以进行 NxN 比较
+        cy_i = cy.unsqueeze(2); cy_j = cy.unsqueeze(1)
+        
+        # 3. 计算关系满足度 (Scores)
+        
+        # --- Relation 1 & 5: ABOVE / ON_TOP (i 在 j 上方 -> i.y < j.y) ---
+        diff_above = cy_j - cy_i 
+        score_above = torch.sigmoid(diff_above * 5.0) 
+        
+        # --- Relation 2: BELOW (i 在 j 下方 -> i.y > j.y) ---
+        diff_below = cy_i - cy_j
+        score_below = torch.sigmoid(diff_below * 5.0)
+        
+        # --- Relation 3: INSIDE ---
+        # 略微简化，只计算中心点距离是否够近
+        # (严谨的 Inside 计算比较耗时，RL 中用距离代理通常够用)
+        dist_sq = (cx.unsqueeze(2) - cx.unsqueeze(1))**2 + (cy.unsqueeze(2) - cy.unsqueeze(1))**2
+        score_inside = torch.exp(-dist_sq * 10.0) # 距离越近分越高
+        
+        # 4. 根据关系矩阵聚合奖励
+        mask_above = (rel_matrix_seq == 1) | (rel_matrix_seq == 5)
+        mask_below = (rel_matrix_seq == 2)
+        mask_inside = (rel_matrix_seq == 3)
+        
+        total_rewards_matrix = torch.zeros_like(score_above)
+        total_rewards_matrix = torch.where(mask_above, score_above, total_rewards_matrix)
+        total_rewards_matrix = torch.where(mask_below, score_below, total_rewards_matrix)
+        total_rewards_matrix = torch.where(mask_inside, score_inside, total_rewards_matrix)
+        
+        valid_rel_mask = mask_above | mask_below | mask_inside
+        
+        obj_rel_sum = (total_rewards_matrix * valid_rel_mask.float()).sum(dim=2)
+        obj_rel_count = valid_rel_mask.float().sum(dim=2).clamp(min=1.0)
+        
+        final_rel_reward = obj_rel_sum / obj_rel_count
+        has_relation = (valid_rel_mask.sum(dim=2) > 0).float()
+        
+        return final_rel_reward * has_relation
+
+    def _calculate_overlap_penalty(self, pred_boxes):
+        """计算重叠惩罚 (Penalty)。向量化版本。"""
+        B, T, _ = pred_boxes.shape
+        
+        # 展开计算 Pairwise IoU
+        x1 = pred_boxes[..., 0] - pred_boxes[..., 2]/2
+        y1 = pred_boxes[..., 1] - pred_boxes[..., 3]/2
+        x2 = pred_boxes[..., 0] + pred_boxes[..., 2]/2
+        y2 = pred_boxes[..., 1] + pred_boxes[..., 3]/2
+        area = pred_boxes[..., 2] * pred_boxes[..., 3]
+        
+        # Broadcasting
+        ix1 = torch.max(x1.unsqueeze(2), x1.unsqueeze(1))
+        iy1 = torch.max(y1.unsqueeze(2), y1.unsqueeze(1))
+        ix2 = torch.min(x2.unsqueeze(2), x2.unsqueeze(1))
+        iy2 = torch.min(y2.unsqueeze(2), y2.unsqueeze(1))
+        
+        i_w = (ix2 - ix1).clamp(min=0)
+        i_h = (iy2 - iy1).clamp(min=0)
+        inter_area = i_w * i_h
+        
+        union_area = area.unsqueeze(2) + area.unsqueeze(1) - inter_area
+        iou_mat = inter_area / (union_area + 1e-6)
+        
+        # 排除自身
+        diag_mask = torch.eye(T, device=pred_boxes.device).bool().unsqueeze(0).expand(B, T, T)
+        iou_mat.masked_fill_(diag_mask, 0.0)
+        
+        # 找到每个物体最大的重叠对象
+        max_iou, _ = iou_mat.max(dim=2) 
+        penalty = F.relu(max_iou - 0.05)
+        
+        return penalty
+
     def _calculate_attention_alignment(self, attn_maps, boxes):
-        """
-        [架构级创新] 计算 Cross-Attention Map 与 矩形框的重合度。
-        强制模型‘眼睛’看的地方就是‘框’标注的地方。
-        """
+        """计算 Cross-Attention Map 与 矩形框的重合度。"""
         B, T, H, W = attn_maps.shape
         alignment_scores = torch.zeros(B, T, device=boxes.device)
         
         for b in range(B):
             for t in range(T):
-                # 构造框的 Binary Mask
                 box = boxes[b, t]
                 x1, y1 = int((box[0]-box[2]/2)*W), int((box[1]-box[3]/2)*H)
                 x2, y2 = int((box[0]+box[2]/2)*W), int((box[1]+box[3]/2)*H)
                 
-                # 计算框内注意力占比
                 attn_map = attn_maps[b, t]
                 total_attn = attn_map.sum() + 1e-6
                 
-                # 限制坐标范围
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(W, x2), min(H, y2)
                 
@@ -127,22 +268,18 @@ class RLTrainer(LayoutTrainer):
         
         return alignment_scores
 
-    def _calculate_gestalt_reward(self, gestalt, class_ids):
-        """
-        奖励符合意象特征的动态势能倾向。
-        """
-        B, T, _ = gestalt.shape
-        r = torch.zeros(B, T, device=gestalt.device)
-        # gestalt indices: 0:bias_x, 1:bias_y, 2:rot, 3:flow
-        
-        for b in range(B):
-            for t in range(T):
-                cid = int(class_ids[b, t].item())
-                if cid == 2: # 山：奖励向上张力 (negative bias_y)
-                    r[b, t] = -gestalt[b, t, 1].clamp(max=0) 
-                elif cid == 3: # 水：奖励横向张力 (abs bias_x)
-                    r[b, t] = torch.abs(gestalt[b, t, 0]).clamp(max=0.5)
-        return r
+    def _plot_reward_history(self):
+        if not self.reward_history: return
+        plt.figure(figsize=(10, 5))
+        plt.plot(self.reward_history)
+        plt.title("RL Reward Trajectory (V8.0 Data-Driven)")
+        plt.xlabel("Epoch")
+        plt.ylabel("Average Reward")
+        plt.grid(True)
+        try:
+            plt.savefig(self.plot_path_reward)
+            plt.close()
+        except Exception: pass
 
     def train_rl_epoch(self, epoch):
         self.model.train()
@@ -150,62 +287,63 @@ class RLTrainer(LayoutTrainer):
         steps = 0
         
         for step, batch in enumerate(self.train_loader):
-            for k, v in batch.items():
-                if isinstance(v, torch.Tensor): batch[k] = v.to(self.device)
+            for k in batch:
+                if isinstance(batch[k], torch.Tensor):
+                    batch[k] = batch[k].to(self.device)
             
             # --- SCST 训练逻辑 ---
             self.model.eval()
             with torch.no_grad():
-                # [MODIFIED] 基础坐标 + 态势参数 (8维)
+                # Baseline: Greedy Decode
                 baseline_layout, _ = self.model.forward_rl(
                     batch['input_ids'], batch['attention_mask'], batch['kg_class_ids'], 
-                    batch['padding_mask'], batch['kg_spatial_matrix'], batch['location_grids'],
+                    batch['padding_mask'], batch.get('kg_spatial_matrix'), batch.get('location_grids'),
                     sample=False
                 )
                 reward_baseline = self.compute_reward(baseline_layout, batch)
             
             self.model.train()
-            # [MODIFIED] 采样 8 维动作
+            # Sample: Stochastic Decode
             sample_layout, log_probs = self.model.forward_rl(
                 batch['input_ids'], batch['attention_mask'], batch['kg_class_ids'], 
-                batch['padding_mask'], batch['kg_spatial_matrix'], batch['location_grids'],
+                batch['padding_mask'], batch.get('kg_spatial_matrix'), batch.get('location_grids'),
                 sample=True
             )
             
-            # [天马行空创新] 获取 U-Net 内部真实的交叉注意力图
-            # 这一步通常需要对 model 做 hooks，此处逻辑假设已在 forward 中提取出 attn_maps
-            # 如果没有 hook，可以先基于坐标奖励，但在 loss 中加入一致性。
             reward_sample = self.compute_reward(sample_layout, batch)
             
             advantage = reward_sample - reward_baseline
             rl_loss = -(log_probs.sum(dim=1) * advantage).mean()
             
-            # 监督辅助
+            # 监督辅助 (Supervised Loss for Regularization)
             mu, logvar, dynamic_layout_sup, decoder_output = self.model(
                 batch['input_ids'], batch['attention_mask'], batch['kg_class_ids'], 
-                batch['padding_mask'], batch['kg_spatial_matrix'], batch['location_grids'],
+                batch['padding_mask'], batch.get('kg_spatial_matrix'), batch.get('location_grids'),
                 target_boxes=batch['target_boxes']
             )
             
+            # [CRITICAL FIX V8.0] 必须适配 12 个返回值，否则会崩溃
             loss_tuple = self.model.get_loss(
                 pred_cls=None, pred_bbox_ids=None, 
-                pred_boxes=dynamic_layout_sup, # 传入 8 维预测
+                pred_boxes=dynamic_layout_sup, 
                 pred_count=None, layout_seq=None, 
                 layout_mask=batch['loss_mask'], 
-                num_boxes=batch['num_boxes'].to(self.device), 
+                num_boxes=batch['num_boxes'], 
                 target_coords_gt=batch['target_boxes'],
-                kg_spatial_matrix=batch['kg_spatial_matrix'],
-                kg_class_weights=batch['kg_class_weights'],
+                kg_spatial_matrix=batch.get('kg_spatial_matrix'),
+                kg_class_weights=batch.get('kg_class_weights'),
                 kg_class_ids=batch['kg_class_ids'],
                 decoder_output=decoder_output
             )
             
-            supervised_loss = loss_tuple[0]
-            consistency_loss = loss_tuple[-1]
+            # V8.0 Unpacking (12 values)
+            (supervised_loss, l_rel, l_over, l_reg, l_iou, l_size, l_area, 
+             l_align, l_bal, l_clus, l_cons, l_gestalt) = loss_tuple
             
             kl_loss = compute_kl_loss(mu, logvar) if mu is not None else torch.tensor(0.0)
 
-            # 总损失融合
+            # 总损失 = RL Loss + (Supervised + Gestalt + Consistency) * small_weight
+            # 这里的 supervised_loss 已经包含了 reg, relation, gestalt 等所有项
             total_combined_loss = rl_loss + (0.2 * supervised_loss + 0.1 * kl_loss)
             
             self.optimizer.zero_grad()
@@ -218,19 +356,11 @@ class RLTrainer(LayoutTrainer):
             
             if (step + 1) % 10 == 0:
                 stats = self.last_reward_stats
-                print(f"[RL V7.0] Step {step+1} | R:{reward_sample.mean().item():.3f} | Adv:{advantage.mean().item():.2f} | "
-                      f"Align:{stats['Align']:.2f} | Gest:{stats['Gestalt']:.2f} | Cons:{consistency_loss.item():.3f}")
+                print(f"[RL V8.0] Step {step+1} | R:{reward_sample.mean().item():.2f} | "
+                      f"Over:{stats.get('Over',0):.2f} | Veto:{stats.get('Veto',0):.2f} | "
+                      f"GestLoss:{l_gestalt.item():.3f}") # 监控 Gestalt Loss
 
         avg_reward = total_reward / steps
         self.reward_history.append(avg_reward)
         self._plot_reward_history()
         return avg_reward
-
-    def _run_inference_example(self, epoch):
-        """
-        [NEW] 增加解释性输出：保存注意力图和态势场预览
-        """
-        super()._run_inference_example(epoch)
-        # 此处可以扩展：提取 U-Net 交叉注意力图并作为图片保存
-        # 让你能看见模型‘心里’到底把山画在哪了
-        pass

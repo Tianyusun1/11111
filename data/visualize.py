@@ -1,3 +1,5 @@
+# File: data/visualize.py (V7.2: Fixed for 8-dim Gestalt Compatibility)
+
 import os
 from PIL import Image, ImageDraw, ImageFont, ImageColor
 import numpy as np
@@ -26,6 +28,7 @@ CLASS_NAMES = {
 def draw_layout(layout_seq: List[Tuple], poem: str, output_path: str, img_size: Tuple[int, int] = (512, 512)):
     """
     绘制带有颜色标注的布局草图，用于验证语义绑定是否正确。
+    [Fixed] 兼容 V7.0 模型的 8 维态势参数输出。
     """
     try:
         # 创建黑色背景，让彩色标注框更显眼 (更“骚”)
@@ -40,8 +43,13 @@ def draw_layout(layout_seq: List[Tuple], poem: str, output_path: str, img_size: 
             font = ImageFont.load_default()
             
         for item in layout_seq:
-            if len(item) != 5: continue
-            cls_id, cx, cy, w, h = item
+            # [CRITICAL FIX] 兼容性解包
+            # item 可能是 5 维 (旧版) 或 9 维 (V7.0 含态势参数)
+            # 我们只取前 5 个值用于绘图 (cls, cx, cy, w, h)
+            if len(item) < 5: 
+                continue
+                
+            cls_id, cx, cy, w, h = item[:5]
             cls_id = int(cls_id)
             
             # 转换归一化坐标为像素坐标
@@ -58,8 +66,11 @@ def draw_layout(layout_seq: List[Tuple], poem: str, output_path: str, img_size: 
             
             # 绘制类别标签
             label_text = f"{cls_name}"
-            text_pos = (xmin + 2, ymin - 16 if ymin > 20 else ymin + 2)
-            draw.text(text_pos, label_text, fill=color, font=font)
+            # 简单的边界检查防止文字画出界
+            text_x = max(0, min(W - 50, xmin + 2))
+            text_y = max(0, ymin - 16 if ymin > 20 else ymin + 2)
+            
+            draw.text((text_x, text_y), label_text, fill=color, font=font)
         
         # 绘制底部诗句标题
         draw.text((10, H - 25), f"Poem: {poem}", fill="white", font=font)
