@@ -37,25 +37,31 @@ class BBoxTokenizer:
         return np.clip(value, 0.0, 1.0).item()
 
 # =========================================================================
-# 原始 I/O 函数 (保持不变)
+# 原始 I/O 函数 (兼容 V8.0 9维数据)
 # =========================================================================
 
 def layout_seq_to_yolo_txt(layout_seq: List[Tuple], output_path: str):
     """
-    将布局序列 [(cls_id, cx, cy, w, h), ...] 保存为 YOLO 格式的 .txt 文件。
+    将布局序列保存为 YOLO 格式的 .txt 文件。
+    
+    [V8.0 Fix] 兼容 9 维数据 (cls, cx, cy, w, h, bx, by, rot, flow)。
+    函数会自动截取前 5 维几何信息写入文件，避免因长度检查导致文件为空。
+
     Args:
-        layout_seq: 布局序列，每个元素为 (cls_id, cx, cy, w, h)，cls_id 必须是 2-10 范围的整数。
+        layout_seq: 布局序列，每个元素至少包含 (cls_id, cx, cy, w, h)。
         output_path: 输出 .txt 文件路径
     """
-    # 确保写入文件中的 cls_id 是整数
     with open(output_path, 'w', encoding='utf-8') as f:
         for item in layout_seq:
-            if len(item) != 5:
+            # [Fix] 放宽长度检查，只要包含基础的 5 维坐标即可
+            if len(item) < 5:
                 continue
-            # 注意: item 必须是 (cls_id, cx, cy, w, h)
-            cls_id, cx, cy, w, h = item
             
-            # Note: 这里的 cls_id 必须是 2-10 范围的浮点数/整数，直接写入
+            # [Fix] 仅解包前 5 个元素用于标准 YOLO 格式写入
+            # 忽略后 4 维态势参数 (如需保存态势，建议另存为 JSON 或扩展格式)
+            cls_id, cx, cy, w, h = item[:5]
+            
+            # 写入文件
             f.write(f"{int(cls_id)} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
 
 def yolo_txt_to_layout_seq(txt_path: str) -> List[Tuple]:
@@ -74,8 +80,10 @@ def yolo_txt_to_layout_seq(txt_path: str) -> List[Tuple]:
         with open(txt_path, 'r', encoding='utf-8') as f:
             for line in f:
                 parts = line.strip().split()
-                if len(parts) != 5:
+                # [Fix] 同样放宽读取检查，兼容可能包含额外列的文件
+                if len(parts) < 5:
                     continue
+                
                 # 读取时，确保 cls_id 是整数，坐标是浮点数
                 cls_id = int(float(parts[0]))
                 cx, cy, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])

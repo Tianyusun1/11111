@@ -1,4 +1,4 @@
-# File: inference/greedy_decode.py (V8.0: Data-Driven Gestalt & Relaxed Constraints)
+## File: inference/greedy_decode.py (V8.0: Data-Driven Gestalt & Relaxed Constraints)
 
 import torch
 import numpy as np
@@ -20,6 +20,7 @@ except ImportError:
     LocationSignalGenerator = None
 
 # [NEW] Import Integrated Visualization Tool
+# 确保在 data/visualize.py 中实现了 draw_integrated_heatmap
 try:
     from data.visualize import draw_integrated_heatmap
 except ImportError:
@@ -27,19 +28,19 @@ except ImportError:
 # -----------------
 
 # [V8.0] Relaxed Shape Priors (Data-Driven Approach)
-# Since the model now learns physical properties from real images (OpenCV extraction),
-# we remove strict 'max' constraints to allow the model to predict extreme shapes (e.g., tall mountains, long rivers).
-# We only keep minimal 'min' constraints to prevent invisible objects.
+# 模型现在通过自监督从真实水墨画中学习物理规律，因此我们移除严格的 'max' 限制，
+# 允许模型预测“写意”的极端形状（如极高的山、极长的水流）。
+# 仅保留最小 'min' 限制，防止生成不可见的微小物体。
 CLASS_SHAPE_PRIORS = {
-    2: {'min_w': 0.05, 'min_h': 0.05}, # Mountain
-    3: {'min_w': 0.05, 'min_h': 0.02}, # Water
-    4: {'min_w': 0.01, 'min_h': 0.02}, # People
-    5: {'min_w': 0.02, 'min_h': 0.05}, # Tree
-    6: {'min_w': 0.03, 'min_h': 0.03}, # Building
-    7: {'min_w': 0.05, 'min_h': 0.02}, # Bridge
-    8: {'min_w': 0.01, 'min_h': 0.01}, # Flower
-    9: {'min_w': 0.01, 'min_h': 0.01}, # Bird
-    10: {'min_w': 0.02, 'min_h': 0.02} # Animal
+    2: {'min_w': 0.05, 'min_h': 0.05}, # Mountain (山)
+    3: {'min_w': 0.05, 'min_h': 0.02}, # Water (水)
+    4: {'min_w': 0.01, 'min_h': 0.02}, # People (人)
+    5: {'min_w': 0.02, 'min_h': 0.05}, # Tree (树)
+    6: {'min_w': 0.03, 'min_h': 0.03}, # Building (楼)
+    7: {'min_w': 0.05, 'min_h': 0.02}, # Bridge (桥)
+    8: {'min_w': 0.01, 'min_h': 0.01}, # Flower (花)
+    9: {'min_w': 0.01, 'min_h': 0.01}, # Bird (鸟)
+    10: {'min_w': 0.02, 'min_h': 0.02} # Animal (兽)
 }
 
 # Class ID Mapping
@@ -52,6 +53,18 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     """
     Query-Based decoding with Location Guidance & CVAE Diversity.
     [Updated V8.0] Supports 8-dim output (Coords + Gestalt) and relaxed constraints.
+    
+    Args:
+        model: Trained Poem2LayoutGenerator
+        tokenizer: BertTokenizer
+        poem: Input poem string
+        max_elements: Max number of objects to generate
+        device: 'cuda' or 'cpu'
+        mode: 'greedy' or 'sample' (affects location generation)
+        top_k: Top-K sampling for location generation
+        
+    Returns:
+        layout: List of tuples [(cls_id, cx, cy, w, h, bx, by, rot, flow), ...]
     """
     if PoetryKnowledgeGraph is None:
         return []
@@ -97,8 +110,10 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     
     # Build Spatial Matrix
     try:
+        # Try passing obj_ids if supported (Updated KG)
         kg_spatial_matrix_np = pkg.extract_spatial_matrix(poem, obj_ids=kg_class_ids)
     except TypeError:
+        # Fallback to standard extraction
         kg_spatial_matrix_np = pkg.extract_spatial_matrix(poem)
         
     kg_spatial_matrix = torch.as_tensor(kg_spatial_matrix_np, dtype=torch.long).unsqueeze(0).to(device)
@@ -113,12 +128,14 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
         
         for i, cls_id in enumerate(kg_class_ids):
             # Get spatial relations row/col
-            if i < kg_spatial_matrix_np.shape[0]:
+            # Handle potential shape mismatch if matrix is smaller/larger
+            mat_len = kg_spatial_matrix_np.shape[0]
+            if i < mat_len:
                 row = kg_spatial_matrix_np[i]
                 col = kg_spatial_matrix_np[:, i]
             else:
-                row = np.zeros(len(kg_class_ids))
-                col = np.zeros(len(kg_class_ids))
+                row = np.zeros(mat_len)
+                col = np.zeros(mat_len)
             
             # Infer location signal
             signal, current_occupancy = location_gen.infer_stateful_signal(
@@ -126,7 +143,7 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
                 mode=mode, top_k=top_k 
             )
             
-            # Jitter
+            # Jitter for robustness during sampling
             if mode == 'sample' and random.random() < 0.6:
                 shift_val = random.randint(-2, 2)
                 signal = torch.roll(signal, shifts=shift_val, dims=1)
@@ -138,13 +155,14 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
             
         location_grids_tensor = torch.stack(grids_list).unsqueeze(0).to(device)
 
-        # Draw Heatmaps (Optional)
+        # Draw Heatmaps (Optional, saved to disk)
         if draw_integrated_heatmap is not None and len(heatmap_layers) > 0:
             safe_poem_name = "".join(x for x in poem if x.isalnum())[:10]
             save_dir = os.path.join("outputs", "heatmaps")
             os.makedirs(save_dir, exist_ok=True)
             save_path = os.path.join(save_dir, f"integrated_{safe_poem_name}.png")
             draw_integrated_heatmap(heatmap_layers, poem, save_path)
+            # print(f"[Info] Heatmap saved to {save_path}")
     # ==========================================
     
     # 4. Forward Pass
@@ -154,7 +172,8 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
     padding_mask = torch.zeros(kg_class_tensor.shape, dtype=torch.bool).to(device)
     
     with torch.no_grad():
-        # Model returns: mu, logvar, dynamic_layout (8 dims), decoder_output
+        # Model returns: mu, logvar, dynamic_layout, decoder_output
+        # dynamic_layout shape: [1, seq_len, 8] (Coords + Gestalt)
         _, _, pred_boxes, _ = model(
             input_ids=input_ids, 
             attention_mask=attention_mask, 
@@ -166,29 +185,39 @@ def greedy_decode_poem_layout(model, tokenizer, poem: str, max_elements=None, de
         
     # 5. Format Output (V8.0 Update)
     layout = []
+    # pred_boxes[0] shape: [seq_len, 8]
     boxes_flat = pred_boxes[0].cpu().tolist()
     
     for cls_id, box in zip(kg_class_ids, boxes_flat):
         cid = int(cls_id)
         
-        # [CRITICAL] Slice first 4 dims for coordinates, keep rest for Gestalt
+        # [CRITICAL] Slice first 4 dims for coordinates
         # box structure: [cx, cy, w, h, bx, by, rot, flow]
-        cx, cy, w, h = box[:4] 
-        
+        if len(box) >= 4:
+            cx, cy, w, h = box[:4] 
+        else:
+            # Fallback (should not happen with correct model)
+            cx, cy, w, h = 0.5, 0.5, 0.1, 0.1
+
         # Minimal Shape Constraints (Sanity Check)
         w = max(w, 0.01)
         h = max(h, 0.01)
         
-        # Apply only MIN constraints from priors, ignore MAX to allow data-driven shapes
+        # Apply only MIN constraints from priors
+        # Ignore MAX to allow data-driven "Gestalt" shapes
         if cid in CLASS_SHAPE_PRIORS:
             prior = CLASS_SHAPE_PRIORS[cid]
             if 'min_w' in prior: w = max(w, prior['min_w'])
             if 'min_h' in prior: h = max(h, prior['min_h'])
         
         # [CRITICAL] Preserve 4-dim Gestalt Parameters
+        # These come from the model's Tanh/Sigmoid heads, so they are already bounded.
         if len(box) >= 8:
-            gestalt_params = box[4:] # bx, by, rot, flow
+            # bx, by, rot, flow
+            gestalt_params = box[4:8] 
         else:
+            # Fill with default values if model output is only 4D (backward compatibility)
+            # Default: no bias, no rotation, no flow
             gestalt_params = [0.0, 0.0, 0.0, 0.0]
 
         # Reassemble: [cls, cx, cy, w, h, bx, by, rot, flow]

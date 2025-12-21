@@ -333,7 +333,10 @@ class RLTrainer(LayoutTrainer):
                 kg_spatial_matrix=batch.get('kg_spatial_matrix'),
                 kg_class_weights=batch.get('kg_class_weights'),
                 kg_class_ids=batch['kg_class_ids'],
-                decoder_output=decoder_output
+                decoder_output=decoder_output,
+                
+                # [关键修复] 传入 gestalt_mask，确保 Loss 忽略无效的态势数据
+                gestalt_mask=batch.get('gestalt_mask') 
             )
             
             # V8.0 Unpacking (12 values)

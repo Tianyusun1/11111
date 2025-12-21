@@ -1,3 +1,5 @@
+# File: stage2_generation/scripts/prepare_data_taiyi.py (V8.0 Compatible)
+
 import sys
 import os
 import argparse
@@ -61,13 +63,18 @@ def main():
             label_path = os.path.join(args.labels_dir, f"{img_stem}.txt")
             if not os.path.exists(label_path): continue
 
-            # 3. 读取 Box (GT 是 5 维: cls, cx, cy, w, h)
+            # 3. 读取 Box
+            # [Fix] 兼容 5 维 (GT) 或 9 维 (V8.0 Inference) 数据
             boxes = []
             with open(label_path, 'r') as f:
                 for line in f:
                     parts = line.strip().split()
-                    if len(parts) == 5: 
-                        boxes.append(list(map(float, parts)))
+                    if len(parts) >= 5: 
+                        # 截取前 5 维几何信息 (cls, cx, cy, w, h)
+                        # 即使 parts 包含后 4 维态势，这里也只取前 5 维，
+                        # 让 InkWashMaskGenerator 按照类别默认值处理（或后续自行修改 Generator 接口以利用真实态势）
+                        boxes.append(list(map(float, parts[:5])))
+            
             if not boxes: continue
 
             # 4. 【核心修改】生成彩色势能场 Mask

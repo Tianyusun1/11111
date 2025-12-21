@@ -1,10 +1,27 @@
-# models/poem2layout.py (V8.0: Data-Driven Gestalt Supervision)
+# models/poem2layout.py (V8.2: Dynamic Composition - Density Aware Size Priors)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import BertModel
 from .decoder import LayoutDecoder
+
+# ==========================================
+# [V8.2] 定义类别“基准”面积先验 (Base Area Ratio)
+# 这里的数值代表“在多物体复杂构图下”该物体的标准占比
+# 代码会自动根据物体数量(N)进行动态放大
+# ==========================================
+CLASS_AREA_PRIORS = {
+    2: 0.30,   # Mountain (山): 基准 30%
+    3: 0.30,   # Water (水): 基准 30%
+    4: 0.06,   # People (人): 基准 6%
+    5: 0.15,   # Tree (树): 基准 15%
+    6: 0.15,   # Building (建筑)
+    7: 0.10,   # Bridge (桥)
+    8: 0.03,   # Flower (花): 基准 3%
+    9: 0.015,  # Bird (鸟): 基准 1.5% (单只时会自动放大到 6%+)
+    10: 0.05   # Animal (动物)
+}
 
 # === 1. 图神经网络关系先验 (R-GAT) ===
 class GraphRelationPriorNet(nn.Module):
@@ -106,7 +123,7 @@ class Poem2LayoutGenerator(nn.Module):
                  balance_loss_weight: float = 0.5,
                  clustering_loss_weight: float = 1.0, 
                  consistency_loss_weight: float = 1.0, 
-                 gestalt_loss_weight: float = 2.0, # [NEW V8.0] 态势自监督损失权重
+                 gestalt_loss_weight: float = 2.0, # 像素级态势弱监督权重
                  latent_dim: int = 32,               
                  **kwargs): 
         super(Poem2LayoutGenerator, self).__init__()
@@ -127,7 +144,7 @@ class Poem2LayoutGenerator(nn.Module):
         self.balance_loss_weight = balance_loss_weight
         self.clustering_loss_weight = clustering_loss_weight
         self.consistency_loss_weight = consistency_loss_weight
-        self.gestalt_loss_weight = gestalt_loss_weight # [NEW]
+        self.gestalt_loss_weight = gestalt_loss_weight 
         
         self.cond_dropout = nn.Dropout(0.25)
 
@@ -188,7 +205,7 @@ class Poem2LayoutGenerator(nn.Module):
             dropout=dropout
         )
 
-        # === 9. 创新架构：双头预测系统 (Dual-Head Prediction) ===
+        # === 9. 双头预测系统 (Dual-Head Prediction) ===
         decoder_output_size = hidden_size + bb_size
         
         # A. 基础坐标回归头 (BBox Head)
@@ -199,13 +216,21 @@ class Poem2LayoutGenerator(nn.Module):
             nn.Linear(hidden_size, 4)
         )
 
-        # B. 形态态势头 (Object Gestalt Head)
-        # 预测: [bias_x, bias_y, rotation, flow]
-        # 使用 Tanh 将输出限制在 [-1, 1]，匹配 dataset 中归一化后的特征范围
-        self.gestalt_head = nn.Sequential(
+        # B. 形态态势头 (Object Gestalt Head) - [Updated for V8.0 Pixel Learning]
+        # B1. 方向性特征 (Direction): [bias_x, bias_y, rotation] -> Tanh
+        self.gestalt_dir_head = nn.Sequential(
             nn.Linear(decoder_output_size, hidden_size // 2),
-            nn.Tanh(), 
-            nn.Linear(hidden_size // 2, 4)
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 3), 
+            nn.Tanh() 
+        )
+
+        # B2. 强度性特征 (Intensity): [flow] -> Sigmoid
+        self.gestalt_flow_head = nn.Sequential(
+            nn.Linear(decoder_output_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
+            nn.Sigmoid() 
         )
         
         # 10. Consistency Projection
@@ -242,8 +267,7 @@ class Poem2LayoutGenerator(nn.Module):
         content_embed = self.cond_dropout(content_embed)
         
         if target_boxes is not None:
-            # [CRITICAL] CVAE Encoder 只需要几何信息来构建 Latent
-            # target_boxes 可能是 8 维 (含 Gestalt)，切片取前 4 维 (cx, cy, w, h)
+            # 切片取前 4 维 (cx, cy, w, h)
             target_geom = target_boxes[..., :4]
             global_layout_feat = self.layout_encoder(target_geom, mask=padding_mask) 
             mu = self.mu_head(global_layout_feat)
@@ -302,9 +326,10 @@ class Poem2LayoutGenerator(nn.Module):
         # === Outputs ===
         pred_boxes = torch.sigmoid(self.reg_head(decoder_output))
         
-        # Gestalt Head Output: 范围 [-1, 1] (Tanh)
-        # 这对应 Dataset V8.0 中归一化后的 [bias_x, bias_y, rotation, flow]
-        pred_gestalt = self.gestalt_head(decoder_output)
+        # Dual-Head Gestalt Output
+        pred_dir = self.gestalt_dir_head(decoder_output)   # [B, T, 3]
+        pred_flow = self.gestalt_flow_head(decoder_output) # [B, T, 1]
+        pred_gestalt = torch.cat([pred_dir, pred_flow], dim=-1) # [B, T, 4]
         
         dynamic_layout = torch.cat([pred_boxes, pred_gestalt], dim=-1)
         
@@ -325,12 +350,13 @@ class Poem2LayoutGenerator(nn.Module):
         dist = torch.distributions.Normal(dynamic_layout_mu, std)
         
         action_layout = dist.sample()
-        # 坐标部分 clamp [0, 1]
-        coords = torch.clamp(action_layout[..., :4], 0.0, 1.0)
-        # 态势部分保持梯度，不强行 clamp
-        gestalt = action_layout[..., 4:]
         
-        final_action = torch.cat([coords, gestalt], dim=-1)
+        # RL 探索时的物理约束截断
+        coords = torch.clamp(action_layout[..., :4], 0.0, 1.0)
+        g_dir = torch.clamp(action_layout[..., 4:7], -1.0, 1.0)
+        g_flow = torch.clamp(action_layout[..., 7:8], 0.0, 1.0)
+        
+        final_action = torch.cat([coords, g_dir, g_flow], dim=-1)
         log_prob = dist.log_prob(final_action).sum(dim=-1)
         
         if padding_mask is not None:
@@ -338,20 +364,19 @@ class Poem2LayoutGenerator(nn.Module):
 
         return final_action, log_prob
 
-    def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None, decoder_output=None):
+    def get_loss(self, pred_cls, pred_bbox_ids, pred_boxes, pred_count, layout_seq, layout_mask, num_boxes, 
+                 target_coords_gt=None, kg_spatial_matrix=None, kg_class_weights=None, kg_class_ids=None, 
+                 decoder_output=None, gestalt_mask=None): 
         """
-        [V8.0 Updated] 支持 8 维 GT 的混合监督训练
+        [V8.2 Updated] 支持动态密度的类别面积先验
         """
         loss_mask = layout_mask 
         
-        # [CRITICAL FIX] 数据解耦：拆分坐标与态势
-        # pred_boxes: [B, T, 8] -> (coords, gestalt)
         pred_coords = pred_boxes[..., :4]
         pred_gestalt = pred_boxes[..., 4:]
         
-        # 检查 target_coords_gt 维度
         has_gestalt_gt = False
-        if target_coords_gt.shape[-1] >= 8:
+        if target_coords_gt is not None and target_coords_gt.shape[-1] >= 8:
             target_boxes = target_coords_gt[..., :4]
             target_gestalt = target_coords_gt[..., 4:]
             has_gestalt_gt = True
@@ -364,7 +389,7 @@ class Poem2LayoutGenerator(nn.Module):
         
         num_valid = loss_mask.sum().clamp(min=1)
 
-        # 1. 基础几何损失 (坐标回归)
+        # 1. 基础几何损失
         loss_reg = F.smooth_l1_loss(pred_coords, target_boxes, reduction='none') 
         loss_reg = (loss_reg.mean(dim=-1) * loss_mask).sum() / num_valid
         
@@ -380,20 +405,31 @@ class Poem2LayoutGenerator(nn.Module):
         # 2. 高级布局损失
         loss_relation = self._compute_relation_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
         loss_overlap = self._compute_overlap_loss(pred_coords, loss_mask, kg_spatial_matrix, kg_class_ids)
-        loss_size_prior = self._compute_size_loss(pred_coords, loss_mask, num_boxes, kg_class_weights)
+        
+        # [CRITICAL FIX V8.2] 使用类别ID + 动态密度计算尺寸损失
+        loss_size_prior = self._compute_size_loss(pred_coords, loss_mask, num_boxes, kg_class_ids=kg_class_ids)
+        
         loss_alignment = self._compute_alignment_loss(pred_coords, loss_mask)
         loss_balance = self._compute_balance_loss(pred_coords, loss_mask)
         loss_clustering = self._compute_clustering_loss(pred_coords, loss_mask, kg_class_ids)
         loss_consistency = self._compute_consistency_loss(decoder_output, loss_mask)
 
-        # 3. [NEW V8.0] 自监督态势损失 (Gestalt Supervision)
+        # 3. 像素级弱监督态势损失
         loss_gestalt = torch.tensor(0.0, device=pred_boxes.device)
         if has_gestalt_gt:
-            # 预测值与真实提取值均为 [-1, 1] 左右的归一化数值
-            # 计算 bias_x, bias_y, rotation 的误差
             loss_g_vec = F.smooth_l1_loss(pred_gestalt, target_gestalt, reduction='none')
-            loss_gestalt_val = loss_g_vec.mean(dim=-1)
-            loss_gestalt = (loss_gestalt_val * loss_mask).sum() / num_valid
+            loss_g_val = loss_g_vec.mean(dim=-1)
+            
+            if gestalt_mask is not None:
+                if gestalt_mask.shape != loss_mask.shape:
+                      combined_mask = loss_mask
+                else:
+                    combined_mask = loss_mask * gestalt_mask
+            else:
+                combined_mask = loss_mask
+                
+            num_gestalt_valid = combined_mask.sum().clamp(min=1)
+            loss_gestalt = (loss_g_val * combined_mask).sum() / num_gestalt_valid
 
         total_loss = self.reg_loss_weight * loss_reg + \
                      self.iou_loss_weight * loss_iou + \
@@ -405,11 +441,11 @@ class Poem2LayoutGenerator(nn.Module):
                      self.balance_loss_weight * loss_balance + \
                      self.clustering_loss_weight * loss_clustering + \
                      self.consistency_loss_weight * loss_consistency + \
-                     self.gestalt_loss_weight * loss_gestalt # [Added]
+                     self.gestalt_loss_weight * loss_gestalt 
                      
         return total_loss, loss_relation, loss_overlap, \
                loss_reg, loss_iou, loss_size_prior, loss_area, \
-               loss_alignment, loss_balance, loss_clustering, loss_consistency
+               loss_alignment, loss_balance, loss_clustering, loss_consistency, loss_gestalt
 
     def _compute_consistency_loss(self, decoder_output, mask):
         if decoder_output is None:
@@ -545,17 +581,51 @@ class Poem2LayoutGenerator(nn.Module):
             return loss / count
         return loss
 
-    def _compute_size_loss(self, pred_boxes, mask, num_boxes, weights=None):
+    # [CRITICAL FIX] 动态密度感知尺寸损失 (Dynamic Density-Aware Size Loss)
+    def _compute_size_loss(self, pred_boxes, mask, num_boxes, kg_class_ids=None):
         pred_areas = pred_boxes[..., 2] * pred_boxes[..., 3] 
+        
+        # 1. 默认启发式基准 (0.5 / sqrt(N)) - 用于未知类别
         if num_boxes is None:
-            N = mask.sum(dim=1).clamp(min=1).float() 
+            # mask: [B, T], N_per_sample: [B, 1]
+            N_per_sample = mask.sum(dim=1, keepdim=True).clamp(min=1).float()
         else:
-            N = num_boxes.float().clamp(min=1)
-        base_expected_area = (0.5 / torch.sqrt(N)).unsqueeze(1) 
-        if weights is not None:
-            target_areas = base_expected_area * weights
-        else:
-            target_areas = base_expected_area.expand_as(pred_areas)
+            N_per_sample = num_boxes.float().clamp(min=1).unsqueeze(1) # [B, 1]
+            
+        base_expected_area = (0.5 / torch.sqrt(N_per_sample)).expand_as(pred_areas)
+        target_areas = base_expected_area.clone()
+
+        # 2. [V8.2] 应用动态类别的面积先验
+        if kg_class_ids is not None:
+            # A. 查表获取基准 (Base Prior)
+            prior_lookup = torch.full((20,), -1.0, device=pred_boxes.device)
+            for cid, area in CLASS_AREA_PRIORS.items():
+                prior_lookup[cid] = area
+            
+            # class_priors: [B, T]
+            class_priors = prior_lookup[kg_class_ids]
+            
+            # B. 计算密度缩放因子 (Density Scaling Factor)
+            # N=1 -> x4.0 (主角特写)
+            # N=2 -> x2.5
+            # N<=5 -> x1.5
+            # N>5 -> x1.0 (保持基准，突出重点)
+            density_scale = torch.ones_like(N_per_sample)
+            density_scale[N_per_sample == 1] = 4.0
+            density_scale[N_per_sample == 2] = 2.5
+            density_scale[(N_per_sample > 2) & (N_per_sample <= 5)] = 1.5
+            
+            # C. 应用缩放
+            # broadcast scaling: [B, 1] -> [B, T]
+            scaled_priors = class_priors * density_scale
+            
+            # D. 安全截断 (最大不超过 90%，留白)
+            scaled_priors = torch.clamp(scaled_priors, max=0.90)
+            
+            # E. 融合 (只覆盖有定义先验的类别)
+            has_prior_mask = (class_priors > 0).float()
+            target_areas = has_prior_mask * scaled_priors + (1.0 - has_prior_mask) * target_areas
+
         loss = F.smooth_l1_loss(pred_areas, target_areas, reduction='none')
         loss = (loss * mask).sum() / mask.sum().clamp(min=1)
         return loss

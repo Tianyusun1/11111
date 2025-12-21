@@ -199,7 +199,8 @@ class LayoutTrainer:
                     kg_spatial_matrix=batch.get('kg_spatial_matrix'),
                     kg_class_weights=batch.get('kg_class_weights'),
                     kg_class_ids=batch['kg_class_ids'], 
-                    decoder_output=decoder_output
+                    decoder_output=decoder_output,
+                    gestalt_mask=batch.get('gestalt_mask') # [NEW V8.0] 传入态势Mask，忽略无效提取
                 )
                 
                 # [CRITICAL UPDATE V8.0] 解包 12 个返回值 (新增 consistency 和 gestalt)
