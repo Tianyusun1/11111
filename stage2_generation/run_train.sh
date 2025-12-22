@@ -11,8 +11,9 @@ PROJECT_ROOT=$(pwd)
 # [缓存与输出]
 export HF_HOME="$PROJECT_ROOT/.hf_cache"
 mkdir -p "$HF_HOME"
-# 建议输出目录使用绝对路径或明确的相对路径
-OUTPUT_DIR="/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2"
+
+# [修改点 1] 输出目录改为单流版本
+OUTPUT_DIR="/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v8_single_plus"
 
 # [模型路径]
 MODEL_NAME="/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1"
@@ -41,14 +42,16 @@ fi
 
 # 3. 开始训练
 echo "========================================================"
-echo "🚀 启动 Stage 2 训练 (改进版双流 ControlNet)"
+echo "🚀 启动 Stage 2 训练 (V8.6: 单流纹理 ControlNet)"
 echo "   基础模型: $MODEL_NAME"
 echo "   数据目录: $DATA_DIR"
 echo "   输出目录: $OUTPUT_DIR"
 echo "   分辨率: 512 | 混合精度: fp16"
+echo "   策略: Smart Freeze (冻结大部分 ControlNet，仅训 LoRA + Adapter)"
 echo "========================================================"
 
-# [修改点] 移除了不支持的 --lambda_perceptual 参数
+# [修改点 2] 启动命令更新
+# 添加了 --smart_freeze 
 accelerate launch --config_file "$ACCELERATE_CONFIG" --mixed_precision="fp16" stage2_generation/scripts/train_taiyi.py \
  --pretrained_model_name_or_path="$MODEL_NAME" \
  --train_data_dir="$DATA_DIR" \
@@ -60,4 +63,5 @@ accelerate launch --config_file "$ACCELERATE_CONFIG" --mixed_precision="fp16" st
  --num_train_epochs=20 \
  --checkpointing_steps=2000 \
  --lambda_struct=0.1 \
- --mixed_precision="fp16"
+ --mixed_precision="fp16" \
+ --smart_freeze

@@ -1,4 +1,4 @@
-# File: inference.py (V8.0: End-to-End Data-Driven Gestalt Inference)
+# File: stage2_generation/inference.py (V8.7: Single-Stream + Learned Multi-Scale Weights)
 
 import sys
 import os
@@ -13,7 +13,12 @@ from diffusers import StableDiffusionControlNetPipeline, ControlNetModel
 
 # === 路径配置 & 导入 ===
 current_file_path = os.path.abspath(__file__)
-project_root = os.path.dirname(current_file_path) # 假设 inference.py 在根目录
+# [Fix] 自动定位项目根目录
+if os.path.basename(os.path.dirname(current_file_path)) == "stage2_generation":
+    project_root = os.path.dirname(os.path.dirname(current_file_path))
+else:
+    project_root = os.path.dirname(current_file_path)
+
 if project_root not in sys.path:
     sys.path.append(project_root)
 
@@ -25,25 +30,46 @@ try:
     from data.visualize import draw_layout
 except ImportError as e:
     print(f"[Error] 模块导入失败: {e}")
-    print("请确保 inference.py 位于项目根目录，或者 PYTHONPATH 设置正确。")
+    print(f"当前 Python Path: {sys.path}")
+    print("请确保 inference.py 位于 stage2_generation 目录中，且项目结构完整。")
     sys.exit(1)
 
 # =============================================================
-# [V8.0 组件] 态势感知注意力处理器 (PoemInkAttentionProcessor)
+# [架构一致性] 定义与训练时相同的权重模块 (ControlNetScaler)
+# =============================================================
+class ControlNetScaler(torch.nn.Module):
+    """
+    [架构创新] 自适应多尺度特征加权模块
+    推理时加载训练好的权重，对 ControlNet 的 13 层特征进行动态缩放。
+    """
+    def __init__(self, num_scales=13, init_value=1.0):
+        super().__init__()
+        self.scales = torch.nn.Parameter(torch.full((num_scales,), init_value, dtype=torch.float32))
+
+    def forward(self, down_samples, mid_sample):
+        weighted_down = []
+        for i, sample in enumerate(down_samples):
+            # 推理时显式转换 dtype 以防万一 (fp16/fp32 兼容)
+            dtype = sample.dtype
+            weighted_down.append(sample * self.scales[i].to(dtype))
+        
+        dtype = mid_sample.dtype
+        weighted_mid = mid_sample * self.scales[-1].to(dtype)
+        return weighted_down, weighted_mid
+
+# =============================================================
+# [V8.0 组件] 态势感知注意力处理器 (GAP Module)
 # =============================================================
 class PoemInkAttentionProcessor:
     """
-    V8.0 核心：将 8 维布局中的物理态势 (Bias) 注入到 Cross-Attention 中。
-    确保生成的画面笔触与 InkMask 的动态墨迹位置一致。
+    将 Layout 中的物理态势 (Bias) 注入到 Cross-Attention 中。
     """
     def __init__(self, dynamic_layout, tokenizer, prompt, device, scale=8.0):
-        # dynamic_layout: [N, 9] -> (cls, cx, cy, w, h, bx, by, rot, flow)
         self.layout = dynamic_layout  
         self.tokenizer = tokenizer
         self.prompt = prompt
         self.device = device
         self.scale = scale 
-
         self.class_to_keyword = {
             2: "山", 3: "水", 4: "人", 5: "树", 6: "屋", 
             7: "桥", 8: "花", 9: "鸟", 10: "兽"
@@ -51,16 +77,13 @@ class PoemInkAttentionProcessor:
 
     def __call__(self, attn, hidden_states, encoder_hidden_states=None, attention_mask=None, **kwargs):
         batch_size, sequence_length, _ = hidden_states.shape
-        
         query = attn.to_q(hidden_states)
         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
         key = attn.to_k(encoder_hidden_states)
         value = attn.to_v(encoder_hidden_states)
-
         query = attn.head_to_batch_dim(query)
         key = attn.head_to_batch_dim(key)
         value = attn.head_to_batch_dim(value)
-
         attention_probs = attn.get_attention_scores(query, key, attention_mask)
 
         # === 态势锚定 (Gestalt Anchoring) ===
@@ -74,33 +97,26 @@ class PoemInkAttentionProcessor:
             if not keyword: continue
             
             # [V8.0] 提取数据驱动的态势参数
-            # item: [cls, cx, cy, w, h, bx, by, rot, flow]
             cx, cy, bw, bh = item[1], item[2], item[3], item[4]
             if len(item) >= 7:
-                bx, by = item[5], item[6] # Bias Shift
+                bx, by = item[5], item[6] 
             else:
                 bx, by = 0.0, 0.0
             
             keyword_token_ids = self.tokenizer.encode(keyword, add_special_tokens=False)
             token_indices = [i for i, t in enumerate(tokens) if t in keyword_token_ids]
-            
             if not token_indices: continue
 
-            # [Alignment Check] 必须与 ink_mask.py (V8.0) 的 center_x 逻辑一致
-            # ink_mask V8.0: center_x = (cx + bx * 0.15)
             x_c, y_c = (cx + bx * 0.15) * w, (cy + by * 0.15) * h
-            
             x1, y1 = int(x_c - (bw/2)*w), int(y_c - (bh/2)*h)
             x2, y2 = int(x_c + (bw/2)*w), int(y_c + (bh/2)*h)
-            
             x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2) # 修正边界为 w, h
+            x2, y2 = min(w, x2), min(h, y2)
 
             if x2 > x1 and y2 > y1:
                 for idx in token_indices:
                     if idx >= attention_probs.shape[-1]: continue
                     mask = torch.zeros((h, w), device=self.device)
-                    # 增强核心区域的注意力
                     mask[y1:y2, x1:x2] = self.scale
                     mask_flat = mask.flatten()
                     attention_probs[:, :, idx] += mask_flat * attention_probs[:, :, idx]
@@ -109,24 +125,22 @@ class PoemInkAttentionProcessor:
         hidden_states = attn.batch_to_head_dim(hidden_states)
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states)
-
         return hidden_states
 
 # =============================================================
-# End-to-End Generator
+# End-to-End Generator (Single Stream)
 # =============================================================
 class EndToEndGenerator:
     def __init__(self, args):
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        print(f"Loading End-to-End System V8.0 on {self.device}...")
+        print(f"Loading End-to-End System V8.7 (Single Stream + Scaler) on {self.device}...")
 
         # 1. 载入配置
-        # 优先读取命令行参数中的 config 路径，或者默认路径
         config_path = os.path.join(project_root, "configs", "default.yaml")
         if not os.path.exists(config_path):
             print(f"[Warning] Config not found at {config_path}. Using internal defaults.")
-            model_cfg = {'hidden_size': 768, 'bb_size': 128, 'decoder_layers': 6, 'decoder_heads': 8, 'latent_dim': 64}
+            model_cfg = {'hidden_size': 768, 'bb_size': 128}
         else:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = yaml.safe_load(f)
@@ -136,7 +150,6 @@ class EndToEndGenerator:
         print("[Stage 1] Loading Layout Generator...")
         self.tokenizer = BertTokenizer.from_pretrained(args.bert_path)
         
-        # 初始化模型 (V8.0 参数)
         self.layout_model = Poem2LayoutGenerator(
             bert_path=args.bert_path,
             num_classes=9,
@@ -145,43 +158,47 @@ class EndToEndGenerator:
             decoder_layers=model_cfg.get('decoder_layers', 6),
             decoder_heads=model_cfg.get('decoder_heads', 8),
             latent_dim=model_cfg.get('latent_dim', 64),
-            gestalt_loss_weight=2.0, # V8.0 Spec
+            gestalt_loss_weight=2.0, 
             dropout=0.0
         )
         
-        # 加载权重
-        checkpoint = torch.load(args.stage1_checkpoint, map_location=self.device)
-        state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
-        # 移除 DDP 可能产生的 'module.' 前缀
-        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        
+        # 加载 Layout 权重
         try:
-            self.layout_model.load_state_dict(state_dict, strict=True)
-            print("✅ Stage 1 Model loaded (Strict Mode).")
-        except RuntimeError as e:
-            print(f"⚠️ Strict loading failed (likely mismatch in V8.0 heads). Trying loose match...")
-            self.layout_model.load_state_dict(state_dict, strict=False)
+            checkpoint = torch.load(args.stage1_checkpoint, map_location=self.device)
+            state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+            state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+            
+            # 尝试严格加载，失败则尝试宽松加载
+            try:
+                self.layout_model.load_state_dict(state_dict, strict=True)
+                print("✅ Stage 1 Model loaded (Strict Mode).")
+            except RuntimeError:
+                print(f"⚠️ Strict loading failed. Trying loose match...")
+                self.layout_model.load_state_dict(state_dict, strict=False)
+        except Exception as e:
+            print(f"⚠️ Layout load warning: {e}")
             
         self.layout_model.to(self.device).eval()
 
         # 3. 初始化 Stage 2 工具
         self.width = 512
         self.height = 512
-        # InkMaskGenerator V8.0
         self.ink_gen = InkWashMaskGenerator(width=self.width, height=self.height) 
 
-        # 4. 加载 Stable Diffusion + ControlNet
-        print(f"[Stage 2] Loading Dual ControlNets & Taiyi...")
-        controlnet_s = ControlNetModel.from_pretrained(
-            os.path.join(args.stage2_checkpoint, "controlnet_structure"), torch_dtype=torch.float16
-        )
-        controlnet_t = ControlNetModel.from_pretrained(
-            os.path.join(args.stage2_checkpoint, "controlnet_style"), torch_dtype=torch.float16
-        )
+        # 4. 加载 Stable Diffusion + Single ControlNet
+        print(f"[Stage 2] Loading Single ControlNet (Structure) & Taiyi...")
+        
+        c_path = os.path.join(args.stage2_checkpoint, "controlnet_structure")
+        if not os.path.exists(c_path):
+            print(f"⚠️ 'controlnet_structure' subdir not found in {args.stage2_checkpoint}. Trying root...")
+            c_path = args.stage2_checkpoint
 
+        controlnet = ControlNetModel.from_pretrained(c_path, torch_dtype=torch.float16)
+        
+        # 初始化 Pipeline (单流)
         self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
             args.base_model_path, 
-            controlnet=[controlnet_s, controlnet_t], 
+            controlnet=controlnet, 
             torch_dtype=torch.float16,
             safety_checker=None 
         )
@@ -194,9 +211,46 @@ class EndToEndGenerator:
                 print(f"✅ LoRA loaded from {lora_path}")
             except Exception as e:
                 print(f"⚠️ LoRA load failed: {e}")
+
+        # =========================================================
+        # [CRITICAL] 注入可学习多尺度权重 (Scaler)
+        # =========================================================
+        # 优先加载 final，其次加载最新 checkpoint
+        scaler_path = os.path.join(args.stage2_checkpoint, "scaler_final.pth")
+        if not os.path.exists(scaler_path):
+             scaler_path = os.path.join(args.stage2_checkpoint, "scaler.pth")
+             
+        if os.path.exists(scaler_path):
+            print(f"✅ Found learned scaler weights at {scaler_path}")
+            
+            # 1. 初始化模块并加载权重
+            self.scaler = ControlNetScaler(num_scales=13)
+            self.scaler.load_state_dict(torch.load(scaler_path, map_location=self.device))
+            self.scaler.to(self.device, dtype=torch.float16)
+            
+            # 打印权重供分析 (可选)
+            scales = self.scaler.scales.detach().cpu().numpy()
+            print(f"📊 Learned Scales: {scales}")
+            print(f"   (Low-level avg: {scales[:4].mean():.2f} | High-level avg: {scales[8:].mean():.2f})")
+            
+            # 2. Monkey Patch: 劫持 ControlNet 的 forward 方法
+            original_forward = self.pipe.controlnet.forward
+            
+            def patched_forward(*args, **kwargs):
+                # 调用原始 forward 获取特征
+                down_res, mid_res = original_forward(*args, **kwargs)
+                # 应用我们的多尺度权重
+                return self.scaler(down_res, mid_res)
+            
+            # 替换方法
+            self.pipe.controlnet.forward = patched_forward
+            print("🔧 Scaler successfully injected into ControlNet forward pass.")
+            
+        else:
+            print("⚠️ No scaler weights found. Using default 1.0 weights.")
         
         self.pipe.to(self.device)
-        self.pipe.enable_model_cpu_offload() # 显存优化
+        self.pipe.enable_model_cpu_offload()
 
     def infer(self, poem, seed=2024, output_name=None):
         print(f"\n🎨 Generating for: {poem}")
@@ -207,7 +261,6 @@ class EndToEndGenerator:
         save_dir.mkdir(parents=True, exist_ok=True)
 
         # === Step 1: Layout Generation (V8.0) ===
-        # 使用 greedy_decode 统一接口，获取 8 维布局
         layout_list = greedy_decode_poem_layout(
             self.layout_model, self.tokenizer, poem, 
             max_elements=30, device=self.device.type, mode='sample', top_k=5
@@ -217,19 +270,16 @@ class EndToEndGenerator:
             print("⚠️ No layout generated.")
             return
 
-        # 转换为 numpy 方便后续处理 [N, 9]
-        layout = np.array(layout_list) # (cls, cx, cy, w, h, bx, by, rot, flow)
+        layout = np.array(layout_list) # [N, 9]
 
         # === Step 2: Visualize Layout ===
-        # draw_layout 能够自适应 5 维或 9 维输入
         draw_layout(layout, f"Layout: {poem}", str(save_dir / "01_layout.png"))
 
         # === Step 3: Gestalt Ink Mask (V8.0) ===
-        # 利用 V8.0 的 InkMaskGenerator 生成动态势能图
         ink_mask = self.ink_gen.convert_boxes_to_mask(layout)
         ink_mask.save(save_dir / "02_ink_mask.png")
 
-        # === Step 4: Attention Injection (V8.0) ===
+        # === Step 4: Attention Injection (GAP) ===
         attn_proc = PoemInkAttentionProcessor(
             dynamic_layout=layout, 
             tokenizer=self.pipe.tokenizer, 
@@ -239,7 +289,7 @@ class EndToEndGenerator:
         )
         self.pipe.unet.set_attn_processor(attn_proc)
 
-        # === Step 5: Diffusion Generation ===
+        # === Step 5: Diffusion Generation (Single Stream) ===
         prompt = f"{poem}，写意水墨画，中国画风格，杰作，留白，意境"
         neg_prompt = "低质量，模糊，色彩斑驳，边框，水印，文字，现代建筑，照片真实感"
         
@@ -248,9 +298,10 @@ class EndToEndGenerator:
         image = self.pipe(
             prompt=prompt, 
             negative_prompt=neg_prompt,
-            image=[ink_mask, ink_mask], # Structure + Style Control
+            image=ink_mask, # 单个图像
             num_inference_steps=35, 
-            controlnet_conditioning_scale=[1.1, 0.8], # 结构权重 > 风格权重
+            # 注意：这里的 1.0 是基础倍率，实际强度由 scaler 内部权重决定
+            controlnet_conditioning_scale=1.0, 
             guidance_scale=7.5, 
             generator=generator
         ).images[0]
@@ -261,10 +312,15 @@ class EndToEndGenerator:
 
 def main():
     parser = argparse.ArgumentParser()
-    # 默认路径配置 (根据你的环境)
+    # 默认路径配置
     parser.add_argument("--bert_path", type=str, default="/home/610-sty/huggingface/bert-base-chinese")
-    parser.add_argument("--stage1_checkpoint", type=str, default="/home/610-sty/layout2paint2/outputs/train_v8/rl_best_reward.pth")
-    parser.add_argument("--stage2_checkpoint", type=str, default="/home/610-sty/layout2paint2/outputs/taiyi_ink_controlnet_v2")
+    
+    # [Config] Stage 1 权重 (保持你指定的路径)
+    parser.add_argument("--stage1_checkpoint", type=str, default="/home/610-sty/layout2paint3/outputs/train_v7_gestal_rl/rl_best_reward.pth")
+    
+    # [Config] Stage 2 路径 (单流输出目录)
+    parser.add_argument("--stage2_checkpoint", type=str, default="/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v8_single")
+    
     parser.add_argument("--base_model_path", type=str, default="/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1")
     parser.add_argument("--output_dir", type=str, default="inference_results_v8")
     
