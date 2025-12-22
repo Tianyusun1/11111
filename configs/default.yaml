@@ -50,12 +50,12 @@ training:
   
   # Logging & Saving
   save_every: 50          
-  output_dir: "./outputs/train_v7_gestalt" # 建议更换输出目录，避免覆盖
+  output_dir: "./outputs/train_v7_gestal_rl" # 建议更换输出目录，避免覆盖
   log_steps: 10
   visualize_every: 5      
 
   # === Stage 2: RL Fine-tuning Configuration ===
-  rl_epochs: 200          
+  rl_epochs: 400          
   rl_learning_rate: 2e-5  
   
   # RL Rewards Weights (核心创新点对齐)

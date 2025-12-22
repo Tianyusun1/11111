@@ -142,7 +142,7 @@ def main():
     parser.add_argument("--mode", type=str, default="sample", choices=["greedy", "sample"], help="Decoding mode")
     parser.add_argument("--top_k", type=int, default=3, help="Top-K for sampling")
     parser.add_argument("--num_samples", type=int, default=3, help="Number of samples per poem")
-    parser.add_argument("--checkpoint", type=str, default="/home/sty/pyfile/5.4.2/outputs/test/rl_best_reward.pth", help="Path to specific checkpoint (default: auto-find best)")
+    parser.add_argument("--checkpoint", type=str, default="/home/610-sty/layout2paint3/outputs/train_v7_gestal_rl/rl_best_reward.pth", help="Path to specific checkpoint (default: auto-find best)")
     args = parser.parse_args()
 
     # Load config

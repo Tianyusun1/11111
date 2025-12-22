@@ -12,13 +12,13 @@ PROJECT_ROOT=$(pwd)
 export HF_HOME="$PROJECT_ROOT/.hf_cache"
 mkdir -p "$HF_HOME"
 # 建议输出目录使用绝对路径或明确的相对路径
-OUTPUT_DIR="/home/610-sty/layout2paint/outputs/taiyi_ink_controlnet_v2"
+OUTPUT_DIR="/home/610-sty/layout2paint3/outputs/taiyi_ink_controlnet_v2"
 
 # [模型路径]
 MODEL_NAME="/home/610-sty/huggingface/Taiyi-Stable-Diffusion-1B-Chinese-v0.1"
 
 # [数据路径配置]
-DATA_DIR="/home/610-sty/layout2paint/taiyi_dataset_v1" 
+DATA_DIR="/home/610-sty/layout2paint3/taiyi_dataset_v8_real_gestalt" 
 
 # Accelerate 配置
 ACCELERATE_CONFIG="stage2_generation/configs/accelerate_config.yaml"
