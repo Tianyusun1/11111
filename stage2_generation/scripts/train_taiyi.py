@@ -1,4 +1,4 @@
-# File: stage2_generation/scripts/train_taiyi.py (V8.7: Single-Stream + Learnable Multi-Scale Weights)
+# File: stage2_generation/scripts/train_taiyi.py (V11.2: Full Restore + Logic Upgrade)
 
 import argparse
 import logging
@@ -51,11 +51,13 @@ except Exception as e:
 import torch
 import torch.nn.functional as F
 import transformers
+import torchvision.models as models
+from torchvision import transforms
+
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from datasets import load_dataset
 from PIL import Image
-from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
@@ -64,37 +66,131 @@ from diffusers import (
     ControlNetModel,
     DDPMScheduler,
     UNet2DConditionModel,
-    StableDiffusionControlNetPipeline,
+    StableDiffusionControlNetPipeline, # [NEW] 引入 Pipeline 用于验证
 )
 from peft import LoraConfig, get_peft_model
 
 logger = get_logger(__name__)
 
 # =========================================================
-# [NEW] 架构创新：可学习的多尺度权重模块
+# [Loss 模块] 掩码引导的感知与风格损失 (VGG19)
+# =========================================================
+class VGGPerceptualAndStyleLoss(torch.nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        print("🎨 Loading VGG19 for Mask-Guided Style Loss...")
+        # 加载预训练 VGG19 并冻结
+        # 使用 weights=models.VGG19_Weights.DEFAULT 替代 deprecated 的 pretrained=True
+        vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features
+        vgg.eval()
+        for param in vgg.parameters():
+            param.requires_grad = False
+        
+        # 切分层级：浅层(纹理)，深层(结构)
+        self.slice1 = torch.nn.Sequential()
+        self.slice2 = torch.nn.Sequential()
+        self.slice3 = torch.nn.Sequential()
+        self.slice4 = torch.nn.Sequential()
+        self.slice5 = torch.nn.Sequential()
+        
+        for x in range(2): self.slice1.add_module(str(x), vgg[x])
+        for x in range(2, 7): self.slice2.add_module(str(x), vgg[x])
+        for x in range(7, 12): self.slice3.add_module(str(x), vgg[x])
+        for x in range(12, 21): self.slice4.add_module(str(x), vgg[x])
+            
+        # 注意：这里我们只用到前21层做Style，后面的层可以不用
+        # for x in range(21, 30): self.slice5.add_module(str(x), vgg[x])
+            
+        self.to(device)
+        # ImageNet 归一化参数
+        self.mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
+        self.std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
+
+    def gram_matrix(self, input, mask=None):
+        """
+        计算 Gram Matrix。如果提供 Mask，则只计算 Mask 区域的纹理统计。
+        """
+        b, c, h, w = input.size()
+        features = input.view(b, c, h * w)
+        
+        if mask is not None:
+            # 确保 mask 是单通道并 resize 到特征图大小
+            # mask: [B, 1, h, w] -> view -> [B, 1, h*w]
+            # interpolate 需要 input 为 [B, C, H, W]
+            mask_resized = F.interpolate(mask, size=(h, w), mode='nearest').view(b, 1, h * w)
+            
+            # 广播乘法
+            features = features * mask_resized
+            
+            # 计算有效像素数作为归一化因子
+            valid_elements = mask_resized.sum(dim=-1, keepdim=True) * c
+            valid_elements = valid_elements.clamp(min=1.0)
+            
+            G = torch.bmm(features, features.transpose(1, 2))
+            return G.div(valid_elements)
+        else:
+            G = torch.bmm(features, features.transpose(1, 2))
+            return G.div(c * h * w)
+
+    def forward(self, input, target, mask_img=None):
+        # 输入 [-1, 1] -> [0, 1] -> ImageNet Norm
+        input = (input + 1) / 2.0
+        target = (target + 1) / 2.0
+        input = (input - self.mean) / self.std
+        target = (target - self.mean) / self.std
+
+        style_loss = 0.0
+        content_loss = 0.0
+        
+        x = input
+        y = target
+        
+        # 预处理 Mask: 
+        # mask_img 期望是单通道 [B, 1, H, W]，且范围 [-1, 1]
+        # 墨色(前景) < 0
+        if mask_img is not None:
+            fg_mask = (mask_img < 0.0).float()
+        else:
+            fg_mask = None
+
+        # 只用到 slice1-4
+        slices = [self.slice1, self.slice2, self.slice3, self.slice4]
+        
+        for i, slice_net in enumerate(slices):
+            x = slice_net(x)
+            y = slice_net(y)
+            
+            # --- Style Loss (每一层都算) ---
+            # 1. 前景风格 (Masked Gram): 强迫墨块区域学到笔触纹理
+            if fg_mask is not None:
+                gm_x_fg = self.gram_matrix(x, fg_mask)
+                gm_y_fg = self.gram_matrix(y, fg_mask)
+                style_loss += F.mse_loss(gm_x_fg, gm_y_fg) * 2.0 
+            
+            # 2. 全局风格
+            gm_x_global = self.gram_matrix(x, None)
+            gm_y_global = self.gram_matrix(y, None)
+            style_loss += F.mse_loss(gm_x_global, gm_y_global)
+
+            # --- Content Loss (用较深层，如第3层) ---
+            if i == 2: 
+                content_loss += F.l1_loss(x, y)
+            
+        return style_loss, content_loss
+
+# =========================================================
+# 可学习的多尺度权重模块 (ControlNetScaler)
 # =========================================================
 class ControlNetScaler(torch.nn.Module):
-    """
-    自适应特征融合模块：
-    为 ControlNet 输出的 13 个特征层 (12 DownBlocks + 1 MidBlock) 
-    分别学习一个独立的权重系数。
-    """
     def __init__(self, num_scales=13, init_value=1.0):
         super().__init__()
-        # 初始化为 1.0，表示从标准 ControlNet 状态开始微调
         self.scales = torch.nn.Parameter(torch.full((num_scales,), init_value, dtype=torch.float32))
 
     def forward(self, down_samples, mid_sample):
-        # down_samples: list of 12 tensors
-        # mid_sample: 1 tensor
-        
         weighted_down = []
         for i, sample in enumerate(down_samples):
-            # 将对应层的权重广播并相乘
             weighted_down.append(sample * self.scales[i])
-            
         weighted_mid = mid_sample * self.scales[-1]
-        
         return weighted_down, weighted_mid
 
 def main():
@@ -107,17 +203,22 @@ def main():
     parser.add_argument("--num_train_epochs", type=int, default=10)
     
     # [CONFIG] 学习率设置
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="ControlNet的学习率")
-    parser.add_argument("--learning_rate_lora", type=float, default=1e-4, help="UNet LoRA的学习率")
+    parser.add_argument("--learning_rate", type=float, default=1e-5)
+    parser.add_argument("--learning_rate_lora", type=float, default=1e-4)
     
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--mixed_precision", type=str, default="fp16") 
     parser.add_argument("--checkpointing_steps", type=int, default=2000)
-    parser.add_argument("--lambda_struct", type=float, default=0.1, help="[已废弃] 结构对齐损失权重")
-    parser.add_argument("--lora_rank", type=int, default=64, help="LoRA的秩")
+    parser.add_argument("--lora_rank", type=int, default=64)
     
-    # [CONFIG] V8.6 智能冻结
-    parser.add_argument("--smart_freeze", action="store_true", default=True, help="开启智能冻结：只训练输入/输出层")
+    # [CONFIG] 损失权重
+    parser.add_argument("--style_loss_weight", type=float, default=100.0)
+    parser.add_argument("--content_loss_weight", type=float, default=1.0)
+    parser.add_argument("--layout_focal_weight", type=float, default=5.0)
+    
+    # [CONFIG] 训练策略
+    parser.add_argument("--smart_freeze", action="store_true", default=True)
+    parser.add_argument("--prompt_drop_rate", type=float, default=0.20)
     
     args = parser.parse_args()
 
@@ -135,12 +236,7 @@ def main():
             datefmt="%m/%d/%Y %H:%M:%S",
             level=logging.INFO,
         )
-        log_file = os.path.join(args.output_dir, "train_loss_history.txt")
-        file_handler = logging.FileHandler(log_file, mode='a')
-        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(message)s"))
-        logger.logger.addHandler(file_handler)
-        logger.info(f"✨ [V8.7 单流+自适应权重版] 启动！")
-        logger.info(f"📝 日志文件: {log_file}")
+        logger.info(f"✨ [V11.2 最终完整版] 启动！Soft-Focal + Timestep-Aware + Validation")
 
     # 1. 加载模型
     tokenizer = transformers.BertTokenizer.from_pretrained(args.pretrained_model_name_or_path, subfolder="tokenizer")
@@ -148,12 +244,10 @@ def main():
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae")
     unet = UNet2DConditionModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="unet")
 
-    # 初始化单流 ControlNet
-    if accelerator.is_main_process:
-        print("正在初始化单流 ControlNet (Structure Stream)...")
     controlnet = ControlNetModel.from_unet(unet)
+    vgg_loss_fn = VGGPerceptualAndStyleLoss(device)
 
-    # 2. LoRA 设置 (负责风格)
+    # 2. LoRA 设置
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.requires_grad_(False) 
@@ -166,289 +260,266 @@ def main():
     )
     unet = get_peft_model(unet, unet_lora_config)
     
-    # [NEW] 初始化可学习权重模块 (13层)
     control_scaler = ControlNetScaler(num_scales=13, init_value=1.0)
     control_scaler.to(device)
     control_scaler.train()
 
     if accelerator.is_main_process:
-        print("✅ LoRA 注入成功 (负责水墨风格学习)")
-        print("✅ 自适应多尺度权重模块 (ControlNetScaler) 已初始化")
-        unet.print_trainable_parameters()
+        print("✅ LoRA 注入成功")
+        print("✅ Scaler 初始化成功")
 
-    # 显存优化
     try:
         unet.enable_xformers_memory_efficient_attention()
         controlnet.enable_xformers_memory_efficient_attention()
-        controlnet.enable_gradient_checkpointing()
-        unet.enable_gradient_checkpointing()
     except Exception:
         pass
 
-    # =========================================================
-    # [Smart Freeze] 智能冻结逻辑
-    # =========================================================
     if args.smart_freeze:
-        controlnet.requires_grad_(False) # 先全冻结
-        trainable_names = []
-        
-        # 1. 解冻输入层 (Hint Block)
-        for n, p in controlnet.controlnet_cond_embedding.named_parameters():
-            p.requires_grad = True
-            trainable_names.append(n)
-        for n, p in controlnet.conv_in.named_parameters():
-            p.requires_grad = True
-            trainable_names.append(n)
+        controlnet.requires_grad_(False) 
+        for n, p in controlnet.controlnet_cond_embedding.named_parameters(): p.requires_grad = True
+        for n, p in controlnet.conv_in.named_parameters(): p.requires_grad = True
+        for n, p in controlnet.controlnet_down_blocks.named_parameters(): p.requires_grad = True
+        for n, p in controlnet.controlnet_mid_block.named_parameters(): p.requires_grad = True
             
-        # 2. 解冻输出层 (Zero Convolutions)
-        for n, p in controlnet.controlnet_down_blocks.named_parameters():
-            p.requires_grad = True
-            trainable_names.append(n)
-        for n, p in controlnet.controlnet_mid_block.named_parameters():
-            p.requires_grad = True
-            trainable_names.append(n)
-            
-        if accelerator.is_main_process:
-            print(f"❄️ [Smart Freeze] 智能冻结已应用！仅训练 Adapter 层和 Zero Convolution。")
-
-    # 3. 优化器 (加入 control_scaler)
     params_to_optimize = [
         {"params": filter(lambda p: p.requires_grad, controlnet.parameters()), "lr": args.learning_rate},
         {"params": unet.parameters(), "lr": args.learning_rate_lora},
-        # [NEW] 权重模块的学习率 (稍微给大一点，让它能动起来)
         {"params": control_scaler.parameters(), "lr": 1e-3} 
     ]
     optimizer = torch.optim.AdamW(params_to_optimize)
 
     # 4. 数据加载
     raw_dataset = load_dataset("json", data_files=os.path.join(args.train_data_dir, "train.jsonl"))["train"]
-    train_testvalid = raw_dataset.train_test_split(test_size=0.1, seed=42)
-    train_dataset = train_testvalid['train']
-    val_dataset = train_testvalid['test'].train_test_split(test_size=0.5, seed=42)['train']
+    train_dataset = raw_dataset 
 
     transform = transforms.Compose([
         transforms.Resize((args.resolution, args.resolution)),
         transforms.ToTensor(),
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
+    # [FIX 1] 加上 Normalize，确保 Mask 也是 [-1, 1]，这样才能判定 < 0.0
     cond_transform = transforms.Compose([
         transforms.Resize((args.resolution, args.resolution)),
         transforms.ToTensor(), 
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]) 
     ])
 
     def collate_fn(examples):
-        pixel_values, cond_pixel_values, input_ids, raw_texts = [], [], [], []
+        pixel_values, cond_pixel_values, input_ids = [], [], []
         for example in examples:
             try:
                 img_path = os.path.join(args.train_data_dir, example["image"])
                 cond_path = os.path.join(args.train_data_dir, example["conditioning_image"])
                 pixel_values.append(transform(Image.open(img_path).convert("RGB")))
                 cond_pixel_values.append(cond_transform(Image.open(cond_path).convert("RGB")))
+                
                 caption = example["text"]
+                if random.random() < args.prompt_drop_rate:
+                    caption = "" 
+                
                 inputs = tokenizer(caption, max_length=tokenizer.model_max_length, 
                                  padding="max_length", truncation=True, return_tensors="pt")
                 input_ids.append(inputs.input_ids[0])
-                raw_texts.append(example["text"])
             except: continue
         return {
             "pixel_values": torch.stack(pixel_values),
             "conditioning_pixel_values": torch.stack(cond_pixel_values),
             "input_ids": torch.stack(input_ids),
-            "texts": raw_texts
         }
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4
     )
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.train_batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4
-    )
 
-    # [IMPORTANT] 加入 control_scaler 到 prepare
-    controlnet, unet, control_scaler, optimizer, train_dataloader, val_dataloader = accelerator.prepare(
-        controlnet, unet, control_scaler, optimizer, train_dataloader, val_dataloader
+    controlnet, unet, control_scaler, optimizer, train_dataloader = accelerator.prepare(
+        controlnet, unet, control_scaler, optimizer, train_dataloader
     )
     
     vae.to(device, dtype=torch.float16)
     text_encoder.to(device, dtype=torch.float16)
 
-    # Loss 记录 (移除了 struct loss)
-    loss_history = {'steps': [], 'total': [], 'mse': []}
+    loss_history = {'steps': [], 'total': [], 'mse': [], 'style': []}
 
     def plot_loss_curve(history, save_path):
         if len(history['steps']) < 2: return
         plt.figure(figsize=(10, 6))
-        plt.plot(history['steps'], history['total'], label='Total Loss', color='blue', alpha=0.6, linewidth=1)
-        plt.plot(history['steps'], history['mse'], label='MSE Loss', color='orange', alpha=0.5, linestyle='--', linewidth=1)
+        plt.plot(history['steps'], history['total'], label='Total Loss', color='blue', alpha=0.6)
+        plt.plot(history['steps'], history['mse'], label='Focal MSE', color='orange', alpha=0.5, linestyle='--')
+        plt.plot(history['steps'], history['style'], label='Style', color='green', alpha=0.5, linestyle=':')
         plt.title(f"Training Loss (Step {history['steps'][-1]})")
-        plt.xlabel("Steps")
-        plt.ylabel("Loss")
         plt.legend()
-        plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        try:
-            plt.savefig(save_path)
-            plt.close()
+        try: plt.savefig(save_path); plt.close()
         except: pass
 
     # 5. 训练循环
     global_step = 0
     if accelerator.is_main_process:
-        print(f"🚀 启动训练流程...")
+        print(f"🚀 启动训练流程... FocalWeight={args.layout_focal_weight}, StyleWeight={args.style_loss_weight}")
         
     for epoch in range(args.num_train_epochs):
         controlnet.train()
         unet.train()
         control_scaler.train()
         
-        train_loss_epoch = 0.0
-        
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet, unet, control_scaler):
                 target_images = batch["pixel_values"].to(dtype=torch.float16)
+                cond_image = batch["conditioning_pixel_values"].to(dtype=torch.float16)
+                
+                # B. Latent Process
                 latents = vae.encode(target_images).latent_dist.sample() * vae.config.scaling_factor
                 noise = torch.randn_like(latents)
                 timesteps = torch.randint(0, 1000, (latents.shape[0],), device=latents.device).long()
+                
                 scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
                 noisy_latents = scheduler.add_noise(latents, noise, timesteps)
                 
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                cond_image = batch["conditioning_pixel_values"].to(dtype=torch.float16)
                 
-                # Condition Dropout (保证控制力的关键)
-                rand_dropout = random.random()
-                if rand_dropout < 0.15:
-                    cond_input = torch.zeros_like(cond_image) # 空 Mask
+                if random.random() < 0.15:
+                    cond_input = torch.zeros_like(cond_image)
                 else:
-                    cond_input = cond_image # 正常纹理 Mask
+                    cond_input = cond_image
                 
-                # ControlNet 前向
-                down_block_res_samples, mid_block_res_sample = controlnet(
-                    noisy_latents, 
-                    timesteps, 
-                    encoder_hidden_states, 
-                    cond_input, 
-                    return_dict=False
-                )
-
-                # [NEW] 应用可学习的层级权重
-                # 注意：显式转换为 fp16 以匹配 UNet 输入
-                weighted_down, weighted_mid = control_scaler(
-                    down_block_res_samples, 
-                    mid_block_res_sample
+                # C. Forward
+                down_res, mid_res = controlnet(
+                    noisy_latents, timesteps, encoder_hidden_states, cond_input, return_dict=False
                 )
                 
-                weighted_down = [s.to(dtype=torch.float16) for s in weighted_down]
-                weighted_mid = weighted_mid.to(dtype=torch.float16)
+                w_down, w_mid = control_scaler(down_res, mid_res)
+                w_down = [s.to(dtype=torch.float16) for s in w_down]
+                w_mid = w_mid.to(dtype=torch.float16)
 
-                # UNet 前向
                 model_pred = unet(
-                    noisy_latents, 
-                    timesteps, 
-                    encoder_hidden_states, 
-                    down_block_additional_residuals=weighted_down,
-                    mid_block_additional_residual=weighted_mid
+                    noisy_latents, timesteps, encoder_hidden_states, 
+                    down_block_additional_residuals=w_down,
+                    mid_block_additional_residual=w_mid
                 ).sample
 
-                # [CLEAN] 仅使用标准 MSE Loss
-                loss_ddpm = F.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-                total_loss = loss_ddpm 
+                # === LOSS 计算 ===
+                
+                # [改进点 1] Soft-Weighted Focal MSE Loss
+                # -----------------------------------------------------
+                raw_mse = F.mse_loss(model_pred.float(), noise.float(), reduction="none")
+                
+                # 下采样 (cond_image is [-1, 1])
+                cond_small = F.interpolate(cond_image.float(), size=raw_mse.shape[-2:], mode="nearest")
+                cond_small_1ch = cond_small.mean(dim=1, keepdim=True) # range [-1, 1]
+                
+                # 软权重逻辑：val=-1(深墨) -> weight=Focal; val=1(白) -> weight=1.0
+                soft_weight_map = 1.0 + (args.layout_focal_weight - 1.0) * ((1.0 - cond_small_1ch) / 2.0)
+                
+                loss_mse = (raw_mse * soft_weight_map).mean()
+                
+                # [改进点 2] Timestep-Aware Style Loss
+                # -----------------------------------------------------
+                loss_style = torch.tensor(0.0, device=device)
+                loss_content = torch.tensor(0.0, device=device)
+                
+                # 策略：只在 t < 800 (画面稍微成型后) 计算 Style
+                # 避免在高噪阶段强行拟合纹理，造成梯度混乱
+                if timesteps.float().mean() < 800:
+                    alphas_cumprod = scheduler.alphas_cumprod.to(device)
+                    alpha_prod_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                    beta_prod_t = 1 - alpha_prod_t
+                    pred_original_latents = (noisy_latents - beta_prod_t ** 0.5 * model_pred) / alpha_prod_t ** 0.5
+                    
+                    pred_images = vae.decode(pred_original_latents.to(dtype=vae.dtype) / vae.config.scaling_factor).sample
+                    
+                    cond_image_1ch = cond_image.float().mean(dim=1, keepdim=True)
+                    loss_style, loss_content = vgg_loss_fn(
+                        pred_images.float(), 
+                        target_images.float(), 
+                        mask_img=cond_image_1ch
+                    )
+                
+                total_loss = loss_mse + \
+                             args.style_loss_weight * loss_style + \
+                             args.content_loss_weight * loss_content
                 
                 accelerator.backward(total_loss)
                 optimizer.step()
                 optimizer.zero_grad()
             
-            train_loss_epoch += total_loss.item()
             global_step += 1
             
-            # Checkpoint 保存
             if global_step % args.checkpointing_steps == 0 and accelerator.is_main_process:
                 ckpt_dir = Path(args.output_dir) / f"checkpoint-{global_step}"
                 os.makedirs(ckpt_dir, exist_ok=True)
                 accelerator.unwrap_model(controlnet).save_pretrained(ckpt_dir / "controlnet_structure") 
                 accelerator.unwrap_model(unet).save_pretrained(ckpt_dir / "unet_lora")
-                # [NEW] 保存 Scale 权重
                 torch.save(accelerator.unwrap_model(control_scaler).state_dict(), ckpt_dir / "scaler.pth")
                 print(f"💾 Checkpoint saved at step {global_step}")
 
-            # 日志与绘图
             if step % 10 == 0 and accelerator.is_main_process:
-                lr_c = optimizer.param_groups[0]['lr']
-                
                 loss_history['steps'].append(global_step)
                 loss_history['total'].append(total_loss.item())
-                loss_history['mse'].append(loss_ddpm.item())
+                loss_history['mse'].append(loss_mse.item())
+                loss_history['style'].append(loss_style.item())
                 
-                # [NEW] 打印权重分布简报
-                current_scales = accelerator.unwrap_model(control_scaler).scales.detach().cpu().numpy()
-                scale_str = ", ".join([f"{s:.2f}" for s in current_scales])
-                low_avg = current_scales[:4].mean()
-                high_avg = current_scales[8:].mean()
-
-                msg = (f"Ep {epoch+1} | Step {step} | Loss: {total_loss.item():.4f} | LR: {lr_c:.1e}")
+                # [FIX] 科学计数法显示 Loss
+                msg = (f"Ep {epoch+1} | Step {step} | Total: {total_loss.item():.4f} | MSE*: {loss_mse.item():.4f} | Style: {loss_style.item():.4e}")
                 print(msg)
-                print(f"   ⚖️ Scales: [{scale_str}] (Low: {low_avg:.2f} / High: {high_avg:.2f})")
                 logger.info(msg)
-                
-                # 记录 Scale 历史
-                with open(os.path.join(args.output_dir, "scales_history.csv"), "a") as f:
-                    f.write(f"{global_step}," + ",".join(map(str, current_scales)) + "\n")
                 
                 if step % 100 == 0:
                     plot_loss_curve(loss_history, os.path.join(args.output_dir, "loss_curve.png"))
 
-        # === 验证 ===
+        # ==========================================
+        # [NEW] Epoch 结束后的验证采样
+        # ==========================================
         if accelerator.is_main_process:
-            print(f"🔍 Epoch {epoch}: 验证中...")
-            plot_loss_curve(loss_history, os.path.join(args.output_dir, "loss_curve.png"))
-        
-        controlnet.eval()
-        unet.eval()
-        
-        try:
-            if accelerator.is_main_process:
-                with torch.autocast(device.type, dtype=torch.float16):
-                    with torch.no_grad():
-                        unwrapped_net = accelerator.unwrap_model(controlnet)
-                        unwrapped_unet = accelerator.unwrap_model(unet)
-                        val_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-                        
-                        # 标准验证 Pipeline (注：这里只能验证默认 Scale=1.0 的效果，
-                        # 因为标准 Pipeline 不支持传入自定义 Layer Weights。
-                        # 但核心目的是检查模型有没有崩，这就够了。)
-                        pipe = StableDiffusionControlNetPipeline(
-                            vae=vae, text_encoder=text_encoder, tokenizer=tokenizer,
-                            unet=unwrapped_unet, 
-                            controlnet=unwrapped_net, 
-                            scheduler=val_scheduler, safety_checker=None, feature_extractor=None
-                        ).to(device)
-                        
-                        test_batch = next(iter(val_dataloader))
-                        test_cond = test_batch["conditioning_pixel_values"][0:1].to(device=device, dtype=torch.float16)
-                        
-                        layout_img_pil = transforms.ToPILImage()(test_cond.squeeze(0).cpu())
-                        layout_img_pil.save(Path(args.output_dir) / f"layout_epoch_{epoch}_val.png")
-
-                        sample_out = pipe(
-                            prompt="山穷水复疑无路，柳暗花明又一村。", 
-                            image=test_cond, 
-                            num_inference_steps=20,
-                            guidance_scale=7.5
-                        ).images[0]
-                        sample_out.save(Path(args.output_dir) / f"sample_epoch_{epoch}_val.png")
-                        print(f"✅ 验证图已保存")
-                        del pipe
-                        torch.cuda.empty_cache()
-        except Exception as e:
-            print(f"验证采样失败: {e}")
+            print(f"🎨 Epoch {epoch+1}: Generating Validation Sample...")
+            try:
+                # 临时切换到 Eval 模式
+                controlnet.eval()
+                unet.eval()
+                torch.cuda.empty_cache()
+                
+                # 取 Batch 第一张图做验证条件
+                # Tensor [-1, 1] -> [0, 1] -> PIL
+                val_cond_tensor = cond_image[0:1].detach().cpu() 
+                val_cond_tensor = (val_cond_tensor * 0.5 + 0.5).clamp(0, 1)
+                val_cond_pil = transforms.ToPILImage()(val_cond_tensor.squeeze(0))
+                
+                pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+                    args.pretrained_model_name_or_path,
+                    unet=accelerator.unwrap_model(unet),
+                    controlnet=accelerator.unwrap_model(controlnet),
+                    torch_dtype=torch.float16,
+                    safety_checker=None
+                ).to(device)
+                
+                val_prompt = "明月松间照，清泉石上流。" # 固定 Prompt 观察效果
+                image = pipeline(
+                    prompt=val_prompt, 
+                    image=val_cond_pil, 
+                    num_inference_steps=20, 
+                    guidance_scale=7.5
+                ).images[0]
+                
+                # 1. 每个 Epoch 必存画作
+                save_path = os.path.join(args.output_dir, f"val_epoch_{epoch+1}.png")
+                image.save(save_path)
+                
+                # 2. 每 20 个 Epoch 存一次 Mask
+                if (epoch + 1) % 20 == 0:
+                    val_cond_pil.save(os.path.join(args.output_dir, f"val_epoch_{epoch+1}_mask.png"))
+                
+                print(f"✅ Validation saved to {save_path}")
+                
+                del pipeline
+                torch.cuda.empty_cache()
+                
+            except Exception as e:
+                print(f"⚠️ Validation failed: {e}")
 
     if accelerator.is_main_process:
-        # 保存最终模型
         save_path_c = Path(args.output_dir) / "controlnet_structure"
         os.makedirs(save_path_c, exist_ok=True)
         accelerator.unwrap_model(controlnet).save_pretrained(save_path_c)
         accelerator.unwrap_model(unet).save_pretrained(Path(args.output_dir) / "unet_lora")
-        # [NEW] 保存最终权重
         torch.save(accelerator.unwrap_model(control_scaler).state_dict(), Path(args.output_dir) / "scaler_final.pth")
         
         plot_loss_curve(loss_history, os.path.join(args.output_dir, "loss_curve_final.png"))

@@ -151,8 +151,11 @@ def main():
         model_cfg = {'hidden_size': 768, 'bb_size': 128}
 
     print("[Stage 1] Loading Poem2Layout Generator...")
+    # [FIX] 显式指向 text_encoder 子目录以加载 BERT
+    bert_subpath = os.path.join(args.taiyi_model_path, "text_encoder")
+    
     layout_model = Poem2LayoutGenerator(
-        bert_path=args.taiyi_model_path, # 借用 Taiyi 的 tokenizer 路径，通常兼容
+        bert_path=bert_subpath,  # <--- 修改处：拼接子目录
         num_classes=9,
         hidden_size=model_cfg.get('hidden_size', 768),
         bb_size=model_cfg.get('bb_size', 128),
@@ -183,7 +186,7 @@ def main():
     controlnet = ControlNetModel.from_pretrained(c_path, torch_dtype=torch.float16)
     
     pipe = StableDiffusionControlNetPipeline.from_pretrained(
-        args.taiyi_model_path,
+        args.taiyi_model_path, # 保持指向根目录，用于加载 model_index.json
         controlnet=controlnet, # 单流
         torch_dtype=torch.float16,
         safety_checker=None
@@ -266,7 +269,8 @@ def main():
         pipe.unet.set_attn_processor(attn_proc)
 
         # Step 5: Generation
-        prompt = f"{poem}，写意水墨画，中国画风格，杰作，留白"
+        # [修改点] 去掉 "写意水墨画..." 等后缀，完全使用原始诗句
+        prompt = poem 
         neg_prompt = "低质量，模糊，色彩斑驳，边框，水印，现代建筑"
         
         generator = torch.Generator(device=device).manual_seed(2024)
