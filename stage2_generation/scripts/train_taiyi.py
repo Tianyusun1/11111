@@ -114,7 +114,7 @@ def main():
     parser.add_argument("--mixed_precision", type=str, default="fp16") 
     parser.add_argument("--checkpointing_steps", type=int, default=2000)
     parser.add_argument("--lambda_struct", type=float, default=0.1, help="[已废弃] 结构对齐损失权重")
-    parser.add_argument("--lora_rank", type=int, default=32, help="LoRA的秩")
+    parser.add_argument("--lora_rank", type=int, default=64, help="LoRA的秩")
     
     # [CONFIG] V8.6 智能冻结
     parser.add_argument("--smart_freeze", action="store_true", default=True, help="开启智能冻结：只训练输入/输出层")
@@ -160,7 +160,7 @@ def main():
     
     unet_lora_config = LoraConfig(
         r=args.lora_rank,
-        lora_alpha=args.lora_rank,
+        lora_alpha=args.lora_rank * 2,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0", "add_k_proj", "add_v_proj"],
     )

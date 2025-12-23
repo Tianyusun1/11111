@@ -298,12 +298,13 @@ class EndToEndGenerator:
         image = self.pipe(
             prompt=prompt, 
             negative_prompt=neg_prompt,
-            image=ink_mask, # 单个图像
+            image=ink_mask, 
             num_inference_steps=35, 
-            # 注意：这里的 1.0 是基础倍率，实际强度由 scaler 内部权重决定
-            controlnet_conditioning_scale=1.0, 
+            # [修改点 1] 保持 ControlNet 权重适中，不要太高，以免锁死结构导致风格出不来
+            controlnet_conditioning_scale=0.8, 
             guidance_scale=7.5, 
-            generator=generator
+            generator=generator,
+            cross_attention_kwargs={"scale": 1.3} 
         ).images[0]
         
         final_name = output_name if output_name else "03_final_painting.png"
